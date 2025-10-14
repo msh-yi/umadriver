@@ -1,0 +1,19 @@
+! r2SCAN-3c TightSCF Opt NumFreq
+%maxcore 8000
+%pal
+	nprocs 2
+end
+%freq
+	Temp 218.15
+end
+%cpcm
+	epsilon 4.50
+	refrac 1.369
+end
+
+* xyz 0 1
+8       -2.045566265      0.000000000     -1.621918676
+1       -2.045566265      0.759337000     -1.035875676
+1       -2.045566265     -0.759337000     -1.025875676
+*
+

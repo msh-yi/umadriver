@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "umadriver"                             # distribution name (no hyphen)
+version = "0.1.0"
+description = "Wrapper for Meta's Universal Model for Atoms with geometry optimization, frequencies, and thermochemistry"
+# readme = "README.md"                         # uncomment if you have one
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "ase>=3.22.1",
+  "fairchem-core>=2.4.0",
+]
+
+[project.scripts]
+umadriver = "umadriver.driver:main"            # CLI: `umadriver`
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["umadriver*"]
