@@ -1,0 +1,93 @@
+# manifest.yaml — example jobs for `umadriver batch --manifest manifest.yaml`
+# Schema: either use a per-job `overrides:` map or flattened keys for quick SP/solv/freq jobs.
+
+jobs:
+  # --- Single-point (no optimization) + Gaussian inputs with SMD(acetonitrile) ---
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/ar3p/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/ar3p/solv
+    optimizer: null
+    optts: false
+    do_freq: falseh
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/ar3p2_Pd_acyl/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/ar3p2_Pd_acyl/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/ar3p2_Pd_aryl/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/ar3p2_Pd_aryl/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/ar3p_Pd_CO_aryl/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/ar3p_Pd_CO_aryl/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/bippy_Pd_acyl/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/bippy_Pd_acyl/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/bippy_Pd_CO_aryl/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/bippy_Pd_CO_aryl/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/CO/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/CO/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/TS_ar3p_Pd_deCO/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/TS_ar3p_Pd_deCO/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/TS_bippy_Pd_deCO/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/TS_bippy_Pd_deCO/solv
+    optimizer: null
+    optts: false
+    do_freq: false
+    solv: acetonitrile
+    gauss_mem: 80GB
+    gauss_nproc: "8"
+
+  # --- Frequency-only example at elevated T (no optimization) ---
+  - xyz: /n/home10/msak/comp/p_coop/uma_opt/Cl_neg/conf_for_solvfreq.xyz
+    out_dir: /n/home10/msak/comp/p_coop/uma_opt/Cl_neg/freq
+    overrides:
+      optimizer: null
+      optts: false
+      do_freq: true
+      temp: 343.15
