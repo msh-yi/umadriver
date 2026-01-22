@@ -152,7 +152,11 @@ def _worker_loop(gpu_id: int,
 # =========================
 def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overrides):
     cfg = _load_manifest(manifest_path)
-    common_cfg = cfg.get("common", {})
+    try:
+        common_cfg = cfg.get("common", {})
+    except AttributeError:
+        print("Did you forget \'jobs'\ at the beginning of the yaml file?")
+        sys.exit(1)
     jobs_cfg = cfg.get("jobs", [])
 
     # Merge CLI overrides -> manifest common -> BatchCommon

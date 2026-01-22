@@ -64,15 +64,33 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=False)
 
     # --- batch subcommand (unchanged) ---
-    pb = sub.add_parser("batch", help="Run multiple ensemble XYZ files in one process (one GPU).")
-    pb.add_argument("--xyz-glob", nargs="*", default=None,
-                    help="One or more globs or paths, e.g. 'inputs/*.xyz'.")
-    pb.add_argument("--manifest", type=str, default=None,
-                    help="YAML or JSON manifest specifying jobs.")
-    pb.add_argument("--out-root", type=str, default="runs",
-                    help="Root directory for job outputs (default: runs/).")
-    pb.add_argument("--resume", action="store_true", default=True,
-                    help="Skip jobs that already have energies.csv (default on).")
+    pb = sub.add_parser(
+        "batch", help="Run multiple ensemble XYZ files in one process (one GPU)."
+    )
+    pb.add_argument(
+        "--xyz-glob",
+        nargs="*",
+        default=None,
+        help="One or more globs or paths, e.g. 'inputs/*.xyz'.",
+    )
+    pb.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="YAML or JSON manifest specifying jobs.",
+    )
+    pb.add_argument(
+        "--out-root",
+        type=str,
+        default="runs",
+        help="Root directory for job outputs (default: runs/).",
+    )
+    pb.add_argument(
+        "--resume",
+        action="store_true",
+        default=True,
+        help="Skip jobs that already have energies.csv (default on).",
+    )
     pb.add_argument("--no-resume", dest="resume", action="store_false")
 
     # Common model/device knobs (apply to all jobs)
@@ -88,6 +106,12 @@ def main():
     pb.add_argument("--solv", default=None)
     pb.add_argument("--irc", action="store_true")
     pb.add_argument("--irc-dx", type=float, default=0.1)
+    pb.add_argument(
+        "--conc-mol-l",
+        type=float,
+        default=None,
+        help="Solution concentration in mol/L for translational entropy (overrides gas pressure).",
+    )
 
     # --- root/common (single) ---
     p.add_argument("--xyz", help="Input XYZ file")
@@ -135,8 +159,12 @@ def main():
     )
 
     # Sella controls (no explicit order flag; set by --optts)
-    p.add_argument("--sella-internal", dest="sella_internal", action="store_true",
-                   help="Use internal coordinates with Sella (default).")
+    p.add_argument(
+        "--sella-internal",
+        dest="sella_internal",
+        action="store_true",
+        help="Use internal coordinates with Sella (default).",
+    )
     p.add_argument("--no-sella-internal", dest="sella_internal", action="store_false")
     p.set_defaults(sella_internal=True)
     p.add_argument("--sella-eta", type=float, default=2e-2)
@@ -152,10 +180,18 @@ def main():
     p.add_argument("--use-local-scratch", action="store_true")
 
     # vibrations / printing
-    p.add_argument("--freq-delta", type=float, default=0.01, help="Finite-difference step in Å")
-    p.add_argument("--freq-nfree", type=int, default=2, help="nfree for Vibrations (2=central)")
-    p.add_argument("--freq-scale", type=float, default=1.0,
-                   help="Scaling factor printed/applied to freqs")
+    p.add_argument(
+        "--freq-delta", type=float, default=0.01, help="Finite-difference step in Å"
+    )
+    p.add_argument(
+        "--freq-nfree", type=int, default=2, help="nfree for Vibrations (2=central)"
+    )
+    p.add_argument(
+        "--freq-scale",
+        type=float,
+        default=1.0,
+        help="Scaling factor printed/applied to freqs",
+    )
 
     # thermochemistry
     p.add_argument("--temp", type=float, default=298.15)
@@ -164,32 +200,60 @@ def main():
     p.add_argument("--point-group", type=str, default=None)
 
     # qRRHO
-    p.add_argument("--qrrho", dest="qrrho", action="store_true", help="Use Quasi-RRHO (default)")
+    p.add_argument(
+        "--qrrho", dest="qrrho", action="store_true", help="Use Quasi-RRHO (default)"
+    )
     p.add_argument("--no-qrrho", dest="qrrho", action="store_false")
     p.set_defaults(qrrho=True)
-    p.add_argument("--cutoff-cm1", type=float, default=None,
-                   help="Thermo cutoff (cm^-1); default 1 (qRRHO) or 35 (RRHO)")
-    p.add_argument("--qrrho-ref-cm1", type=float, default=100.0,
-                   help="QRRHO reference frequency ω0 (cm^-1)")
-    p.add_argument("--qrrho-alpha", type=float, default=4.0,
-                   help="QRRHO damping exponent α")
+    p.add_argument(
+        "--cutoff-cm1",
+        type=float,
+        default=None,
+        help="Thermo cutoff (cm^-1); default 1 (qRRHO) or 35 (RRHO)",
+    )
+    p.add_argument(
+        "--qrrho-ref-cm1",
+        type=float,
+        default=100.0,
+        help="QRRHO reference frequency ω0 (cm^-1)",
+    )
+    p.add_argument(
+        "--qrrho-alpha", type=float, default=4.0, help="QRRHO damping exponent α"
+    )
+    p.add_argument(
+        "--conc-mol-l",
+        type=float,
+        default=None,
+        help="Solution concentration in mol/L for translational entropy (overrides gas pressure).",
+    )
 
     # logging
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--debug", action="store_true")
 
     # always-ensemble outputs
-    p.add_argument("--outdir", default=None,
-                   help="Output directory for ensemble workflow (default: <basename>.ensemble)")
-    p.add_argument("--solv", default=None,
-                   help="Emit Gaussian inputs for M052X/6-31G* and M052X/6-31G* scrf(SMD,solvent=<solv>)")
+    p.add_argument(
+        "--outdir",
+        default=None,
+        help="Output directory for ensemble workflow (default: <basename>.ensemble)",
+    )
+    p.add_argument(
+        "--solv",
+        default=None,
+        help="Emit Gaussian inputs for M052X/6-31G* and M052X/6-31G* scrf(SMD,solvent=<solv>)",
+    )
     p.add_argument("--gauss-mem", default="160GB")
     p.add_argument("--gauss-nproc", default="16")
 
     # IRC
-    p.add_argument("--irc", action="store_true",
-                   help="Run intrinsic reaction coordinate (IRC) after TS/freq or directly.")
-    p.add_argument("--irc-dx", type=float, default=0.1, help="IRC step size dx (default 0.1).")
+    p.add_argument(
+        "--irc",
+        action="store_true",
+        help="Run intrinsic reaction coordinate (IRC) after TS/freq or directly.",
+    )
+    p.add_argument(
+        "--irc-dx", type=float, default=0.1, help="IRC step size dx (default 0.1)."
+    )
 
     # ---- parse now (after all subparsers are defined) ----
     args = p.parse_args()
@@ -201,6 +265,7 @@ def main():
     # ---- batch mode ----
     if args.cmd == "batch":
         from .batch import BatchCommon, run_batch_from_manifest, run_batch_from_glob
+
         common = BatchCommon(
             model=args.model,
             device=args.device,
@@ -210,12 +275,19 @@ def main():
             resume=args.resume,
         )
         overrides = {}
-        if args.optimizer is not None: overrides["optimizer"] = args.optimizer
-        if args.optts: overrides["optts"] = True
-        if args.do_freq: overrides["do_freq"] = True
-        if args.solv is not None: overrides["solv"] = args.solv
-        if args.irc: overrides["irc"] = True
+        if args.optimizer is not None:
+            overrides["optimizer"] = args.optimizer
+        if args.optts:
+            overrides["optts"] = True
+        if args.do_freq:
+            overrides["do_freq"] = True
+        if args.solv is not None:
+            overrides["solv"] = args.solv
+        if args.irc:
+            overrides["irc"] = True
         overrides["irc_dx"] = args.irc_dx
+        if args.conc_mol_l is not None:
+            overrides["conc_mol_L"] = args.conc_mol_l
 
         if args.manifest:
             summary = run_batch_from_manifest(args.manifest, common, **overrides)
@@ -228,9 +300,9 @@ def main():
             print(f"[{item['status']}] {item['xyz']} -> {item['out_dir']}")
         return
 
-    #-------------------------------------------------------------------
+    # -------------------------------------------------------------------
     #              NON-BATCH — always go through ENSEMBLE workflow
-    #-------------------------------------------------------------------
+    # -------------------------------------------------------------------
     if not args.xyz:
         p.error("--xyz is required unless using the 'batch' subcommand")
 
@@ -242,32 +314,59 @@ def main():
         args.outdir = os.path.splitext(os.path.basename(args.xyz))[0] + ".ensemble"
     os.makedirs(args.outdir, exist_ok=True)
 
-    LOG.info("Route: ENSEMBLE (always) | frames from %s | outdir=%s", args.xyz, args.outdir)
+    LOG.info(
+        "Route: ENSEMBLE (always) | frames from %s | outdir=%s", args.xyz, args.outdir
+    )
     if args.solv:
-        LOG.info("Gaussian inputs: solvent=%s | mem=%s | nproc=%s",
-                 args.solv, args.gauss_mem, args.gauss_nproc)
+        LOG.info(
+            "Gaussian inputs: solvent=%s | mem=%s | nproc=%s",
+            args.solv,
+            args.gauss_mem,
+            args.gauss_nproc,
+        )
     if args.freq:
-        LOG.info("Frequencies per conformer will be computed (ORCA-style outputs per structure).")
+        LOG.info(
+            "Frequencies per conformer will be computed (ORCA-style outputs per structure)."
+        )
 
     csv_path = run_conformer_workflow(
-        args.xyz, out_dir=args.outdir,
-        charge=args.charge, mult=args.mult,
-        model=args.model, device=args.device,
-        cache_dir=args.cache_dir, use_local_scratch=args.use_local_scratch,
-        optimizer=(None if args.sp else args.opt), opt_mode=args.opt_mode, optts=args.optts,
+        args.xyz,
+        out_dir=args.outdir,
+        charge=args.charge,
+        mult=args.mult,
+        model=args.model,
+        device=args.device,
+        cache_dir=args.cache_dir,
+        use_local_scratch=args.use_local_scratch,
+        optimizer=(None if args.sp else args.opt),
+        opt_mode=args.opt_mode,
+        optts=args.optts,
         maxcycles=args.maxcycles,
         do_freq=args.freq,
-        freq_delta=args.freq_delta, freq_nfree=args.freq_nfree, freq_scale=args.freq_scale,
+        freq_delta=args.freq_delta,
+        freq_nfree=args.freq_nfree,
+        freq_scale=args.freq_scale,
         temp=args.temp,
         pressure_atm=args.pressure_atm,
-        symmetry_number=args.symmetry_number, point_group=args.point_group,
-        qrrho=args.qrrho, cutoff_cm1=args.cutoff_cm1,
-        qrrho_ref_cm1=args.qrrho_ref_cm1, qrrho_alpha=args.qrrho_alpha,
-        solv=args.solv, gauss_mem=args.gauss_mem, gauss_nproc=args.gauss_nproc,
-        sella_internal=args.sella_internal, sella_eta=args.sella_eta,
-        sella_gamma=args.sella_gamma, sella_delta0=args.sella_delta0,
-        irc=args.irc, irc_dx=args.irc_dx,
+        symmetry_number=args.symmetry_number,
+        point_group=args.point_group,
+        qrrho=args.qrrho,
+        cutoff_cm1=args.cutoff_cm1,
+        qrrho_ref_cm1=args.qrrho_ref_cm1,
+        qrrho_alpha=args.qrrho_alpha,
+        solv=args.solv,
+        gauss_mem=args.gauss_mem,
+        gauss_nproc=args.gauss_nproc,
+        sella_internal=args.sella_internal,
+        sella_eta=args.sella_eta,
+        sella_gamma=args.sella_gamma,
+        sella_delta0=args.sella_delta0,
+        irc=args.irc,
+        irc_dx=args.irc_dx,
+        conc_mol_L=args.conc_mol_l,
+        resume_from_per_conformer_csv=True,
     )
+
     print(f"\nEnsemble complete. Results CSV: {csv_path}")
     return
 

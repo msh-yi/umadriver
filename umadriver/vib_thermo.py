@@ -5,6 +5,7 @@ from ase import Atoms
 from ase.vibrations import Vibrations
 import os
 import glob
+from typing import Optional
 
 from .constants import (
     HARTREE_PER_EV,
@@ -20,6 +21,50 @@ from .constants import (
     theta_per_cm1_K,
 )
 from .writer import ORCAWriter
+
+# Fallback-safe Avogadro
+try:
+    from . import constants as _const_mod
+
+    AVOGADRO = getattr(_const_mod, "AVOGADRO", 6.02214076e23)
+except Exception:
+    AVOGADRO = 6.02214076e23
+
+
+def _free_space_mL_per_L(solv: Optional[str]) -> float:
+    """
+    Return accessible free space (mL per L) for a solute in bulk solvent.
+    Based on Shakhnovich & Whitesides (J. Org. Chem. 1998, 63, 3821) and
+    the GoodVibes implementation.
+
+    Supported keys: 'none', 'H2O', 'toluene', 'DMF', 'AcOH', 'chloroform'.
+    """
+    if not solv:
+        return 1000.0
+
+    solvent_list = ["none", "H2O", "toluene", "DMF", "AcOH", "chloroform"]
+    molarity = [1.0, 55.6, 9.4, 12.9, 17.4, 12.5]  # mol/L
+    molecular_vol = [1.0, 27.944, 149.070, 77.442, 86.10, 97.0]  # Å^3
+
+    try:
+        i = solvent_list.index(solv)
+    except ValueError:
+        # Unknown solvent -> assume full liter is “free”
+        return 1000.0
+
+    if i == 0:  # 'none'
+        return 1000.0
+
+    solv_m = molarity[i]
+    solv_volA3 = molecular_vol[i]
+    # v_free (Å^3 per molecule) for accessible volume
+    v_free = (
+        8.0
+        * ((1e27 / (solv_m * AVOGADRO)) ** (1.0 / 3.0) - solv_volA3 ** (1.0 / 3.0)) ** 3
+    )
+    # Convert to mL free space per liter of bulk solvent
+    freespace_mL_per_L = v_free * solv_m * AVOGADRO * 1e-24
+    return float(freespace_mL_per_L)
 
 
 # ---------- Geometry classification / rotation ----------
@@ -60,8 +105,8 @@ def compute_mass_weighted_modes(vib, atoms: Atoms) -> Tuple[np.ndarray, np.ndarr
       w2: (3N,) eigenvalues of the dynamical matrix (ascending)
     Uses the same Hessian as ASE Vibrations, so ordering aligns with ASE freqs.
     """
-    vd = vib.get_vibrations()          # VibrationsData
-    K4 = vd.get_hessian()              # (N,3,N,3) in eV/Å^2
+    vd = vib.get_vibrations()  # VibrationsData
+    K4 = vd.get_hessian()  # (N,3,N,3) in eV/Å^2
     N = len(atoms)
     K = K4.reshape(3 * N, 3 * N)
 
@@ -71,7 +116,7 @@ def compute_mass_weighted_modes(vib, atoms: Atoms) -> Tuple[np.ndarray, np.ndarr
     D = (inv_sqrt_m[:, None]) * K * (inv_sqrt_m[None, :])
     D = 0.5 * (D + D.T)
 
-    w2, U = np.linalg.eigh(D)          # ascending by eigenvalue
+    w2, U = np.linalg.eigh(D)  # ascending by eigenvalue
     return U, w2
 
 
@@ -96,8 +141,8 @@ def run_frequencies_and_write(
     from ase.vibrations import Vibrations
 
     # thresholds (tune if you like)
-    eps_zero_rigid_cm1 = 1.0   # classify "rigid" by |f| <= this
-    eps_small_cm1      = 5.0   # clamp tiny negatives/positives to +|f| if |f| < this
+    eps_zero_rigid_cm1 = 1.0  # classify "rigid" by |f| <= this
+    eps_small_cm1 = 5.0  # clamp tiny negatives/positives to +|f| if |f| < this
 
     writer.write_energy_grad_banner()
     writer._coords_block6(atoms)
@@ -184,11 +229,13 @@ def run_frequencies_and_write(
     writer.write_normal_modes_matrix(modes_mw, zero_first=zero_first)
 
     # IR spectrum: positive modes only, index = column number
-    vib_modes = [(i, freqs_print[i]) for i in range(zero_first, nmode) if freqs_print[i] > 0.0]
+    vib_modes = [
+        (i, freqs_print[i]) for i in range(zero_first, nmode) if freqs_print[i] > 0.0
+    ]
     writer.write_ir_spectrum(vib_modes)
 
     vib.clean()
-    
+
     # Keep the scratch dir for debugging; if completely empty, remove it.
     try:
         leftover = glob.glob(os.path.join(scratch_dir, "*"))
@@ -200,6 +247,7 @@ def run_frequencies_and_write(
     # Optional CUDA memory hygiene:
     try:
         import gc, torch
+
         del vib
         gc.collect()
         if torch.cuda.is_available():
@@ -220,9 +268,13 @@ def rrho_thermo(
     E_el_Eh: float,
     *,
     qrrho: bool = True,
-    cutoff_cm1: Optional[float] = None,  # None -> set defaults below
+    cutoff_cm1: Optional[float] = None,
     qrrho_ref_cm1: float = 100.0,
     qrrho_alpha: float = 4.0,
+    # NEW:
+    conc_mol_L: Optional[float] = None,
+    solv: Optional[str] = None,
+    multiplicity: int = 1,
 ) -> Dict[str, float]:
     # Remove 3/5/6 zero modes
     I = principal_moments_amuA2(atoms)
@@ -235,44 +287,46 @@ def rrho_thermo(
         start = 6
     vib_cm_all = [f for i, f in enumerate(freqs_cm1) if i >= start and f > 0.0]
 
-    # Defaults for cutoffs
     if cutoff_cm1 is None:
         cutoff_cm1 = 1.0 if qrrho else 35.0
     vib_cm = [f for f in vib_cm_all if f > cutoff_cm1]
 
-    # Mass
     mass_amu = float(np.sum(atoms.get_masses()))
     mass_kg = mass_amu * amu_kg
 
-    # Rotational constants & temperatures (K)
     B_A, B_B, B_C = rotational_constants_cm1_from_I(I)
     theta = [theta_per_cm1_K * b for b in (abs(B_A), abs(B_B), abs(B_C))]
     theta = [t if t > 0 else 1e-30 for t in theta]
 
-    # ZPE base (HO 1/2 hν)
     vib_e = [f * eV_per_cm1 for f in vib_cm]
     ZPE_eV = 0.5 * sum(vib_e)
 
-    # Rotational / translational energies (eV)
-    if geom == "atom":
-        Erot_eV = 0.0
-    else:
-        Erot_eV = (1.0 if geom == "linear" else 1.5) * kB_eV_K * T
+    # Rot/trans energies (unchanged)
+    Erot_eV = (
+        0.0 if geom == "atom" else ((1.0 if geom == "linear" else 1.5) * kB_eV_K * T)
+    )
     Etrans_eV = 1.5 * kB_eV_K * T
 
-    # Translational entropy (Sackur–Tetrode)
-    P_Pa = P_atm * 101325.0
-    S_trans_over_k = (
-        math.log(
-            ((2 * math.pi * mass_kg * kB_J_K * T) ** 1.5)
-            * (kB_J_K * T)
-            / (h_J_s**3 * P_Pa)
-        )
-        + 2.5
-    )
+    # ---------- Translational entropy: pressure OR concentration ----------
+    # S/k = ln( (2π m kT)^{3/2} / (h^3 n) ) + 5/2  where n is number density [1/m^3].
+    # - Gas phase:    n = P / (kT)
+    # - Solution:     n = (conc [mol/L]) * 1000 [L/m^3] * Na / (free_space_fraction),
+    #                 with free-space from Shakhnovich–Whitesides.
+    lambda_factor = ((2.0 * math.pi * mass_kg * kB_J_K * T) ** 1.5) / (h_J_s**3)
+
+    if conc_mol_L is not None:
+        free_mL_per_L = _free_space_mL_per_L(solv)
+        # free-space fraction in a liter:
+        free_frac = max(free_mL_per_L / 1000.0, 1e-9)  # avoid zero
+        number_density = conc_mol_L * 1000.0 * AVOGADRO / free_frac  # 1/m^3
+    else:
+        P_Pa = P_atm * 101325.0
+        number_density = P_Pa / (kB_J_K * T)
+
+    S_trans_over_k = math.log(lambda_factor / number_density) + 2.5
     TS_trans_eV = kB_eV_K * T * S_trans_over_k
 
-    # Rotational entropy (Herzberg)
+    # ---------- Rotational entropy ----------
     if geom == "atom":
         S_rot_over_k = 0.0
     elif geom == "linear":
@@ -286,7 +340,7 @@ def rrho_thermo(
         )
     TS_rot_eV = kB_eV_K * T * S_rot_over_k
 
-    # Vibrational entropy + thermal vibrational energy
+    # ---------- Vibrational entropy + thermal vibrational energy ----------
     I_SI = I * amu_kg * (angstrom_m**2)
     I_av = float(np.mean(I_SI)) if np.any(I_SI > 0) else 1e-46
 
@@ -297,7 +351,6 @@ def rrho_thermo(
         e_eV = f_cm * eV_per_cm1
         x = e_eV / (kB_eV_K * T) if T > 0 else float("inf")
 
-        # HO entropy and thermal energy
         if T > 0:
             S_HO_over_k = (x / (math.expm1(x))) - math.log1p(-math.exp(-x))
             E_th_HO_eV = e_eV / (math.expm1(x))
@@ -310,25 +363,26 @@ def rrho_thermo(
             Evib_corr_eV += E_th_HO_eV
             continue
 
-        # qRRHO mixing weight w(ν)
         w = 1.0 / (1.0 + (qrrho_ref_cm1 / f_cm) ** qrrho_alpha)
 
-        # 1D free-rotor proxy
         nu_Hz = c_cm_s * f_cm
         muK = h_J_s / (8.0 * math.pi**2 * nu_Hz)  # kg·m^2
         muEff = (muK * I_av) / (muK + I_av)
 
-        # 1D FR entropy: S/k = 1/2 + ln( sqrt(8π^2 I kT / h^2) )
         S_FR_over_k = 0.5 + 0.5 * math.log(
             (8.0 * math.pi**2 * muEff * kB_J_K * T) / (h_J_s**2)
         )
 
-        # Mix entropies and thermal energies
         S_vib_over_k += w * S_HO_over_k + (1.0 - w) * S_FR_over_k
-        E_th_mix_eV = w * E_th_HO_eV + (1.0 - w) * (0.5 * kB_eV_K * T)
-        Evib_corr_eV += E_th_mix_eV
+        Evib_corr_eV += w * E_th_HO_eV + (1.0 - w) * (0.5 * kB_eV_K * T)
 
-    TS_el_eV = 0.0
+    # ---------- Electronic entropy (optional; = 0 if multiplicity==1) ----------
+    TS_el_eV = (
+        kB_eV_K
+        * T
+        * (0.0 if multiplicity <= 1 else math.log(max(float(multiplicity), 1.0)))
+    )
+
     E_el_eV = E_el_Eh * EV_PER_HARTREE
 
     U_total_eV = E_el_eV + ZPE_eV + Evib_corr_eV + Erot_eV + Etrans_eV
@@ -339,7 +393,7 @@ def rrho_thermo(
     G_total_eV = H_total_eV - TS_tot_eV
     G_minus_Eel_eV = G_total_eV - E_el_eV
 
-    # Convert to Hartree *before* returning
+    # ---- conversions (unchanged) ----
     ZPE_Eh = ZPE_eV * HARTREE_PER_EV
     Evib_corr_Eh = Evib_corr_eV * HARTREE_PER_EV
     Erot_Eh = Erot_eV * HARTREE_PER_EV
@@ -354,7 +408,7 @@ def rrho_thermo(
     G_total_Eh = G_total_eV * HARTREE_PER_EV
     G_minus_Eel_Eh = G_minus_Eel_eV * HARTREE_PER_EV
 
-    # Symmetry-number sweep table in Eh
+    # symmetry sweep (unchanged)
     rot_table = []
     for sn in range(1, 13):
         if geom == "atom":
@@ -393,4 +447,8 @@ def rrho_thermo(
         cutoff_cm1=float(cutoff_cm1),
         qrrho_ref_cm1=float(qrrho_ref_cm1) if qrrho else None,
         qrrho_alpha=float(qrrho_alpha) if qrrho else None,
+        # NEW echoes:
+        conc_mol_L=conc_mol_L,
+        solv=(solv or "none"),
+        multiplicity=int(multiplicity),
     )
