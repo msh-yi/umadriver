@@ -416,10 +416,18 @@ def run_conformer_workflow(
     _ensure_dir(per_conf_dir)
 
     per_conf_csv = os.path.join(out_dir, f"energies_per_conformer_{job_tag}.csv")
+    LOG.info(
+        "[RESUME] per_conf_csv=%s exists=%s", per_conf_csv, os.path.exists(per_conf_csv)
+    )
     attempted_rows = (
         _load_attempted_conformers(per_conf_csv)
         if resume_from_per_conformer_csv
         else {}
+    )
+    LOG.info(
+        "[RESUME] resume=%s attempted_rows=%d",
+        resume_from_per_conformer_csv,
+        len(attempted_rows),
     )
 
     LOG.info("=== Ensemble workflow (serial) ===")

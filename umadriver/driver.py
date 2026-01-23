@@ -288,6 +288,8 @@ def main():
         overrides["irc_dx"] = args.irc_dx
         if args.conc_mol_l is not None:
             overrides["conc_mol_L"] = args.conc_mol_l
+        if args.resume:
+            overrides["resume_from_per_conformer_csv"] = True
 
         if args.manifest:
             summary = run_batch_from_manifest(args.manifest, common, **overrides)
