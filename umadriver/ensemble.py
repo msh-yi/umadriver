@@ -1,23 +1,17 @@
 # umadriver/ensemble.py
 from __future__ import annotations
 
-import os, csv, time, logging, glob, shutil, queue
-from dataclasses import dataclass
-from typing import Optional, List, Literal, Tuple, Dict
-from pathlib import Path
-import multiprocessing as mp
+import os
+import csv
+import time
+import logging
+from typing import Optional, List, Literal, Tuple, Dict, Any
 
 import numpy as np
-from ase.io import read as ase_read, write as ase_write
 from ase import Atoms
+from ase.io import read as ase_read, write as ase_write
 
 from .types import SellaOpts
-
-try:
-    import cctk  # optional; not required for this workflow
-except Exception:
-    cctk = None
-
 from .constants import (
     HARTREE_PER_EV,
     EV_PER_HARTREE,
@@ -33,12 +27,14 @@ from .utils import (
     build_calculator,
 )
 from .vib_thermo import (
-    run_frequencies_and_write,  # supports ts=... and scratch_dir=...
+    run_frequencies_and_write,
     rrho_thermo,
 )
 from .writer import ORCAWriter
 
 LOG = logging.getLogger("uma.ensemble")
+
+EH_TO_KCAL = EV_PER_HARTREE * KCAL_PER_MOL_PER_EV
 
 
 # -----------------------
@@ -57,7 +53,6 @@ def _safe_float(x, default: float = float("nan")) -> float:
 
 def _safe_int(x, default: int = 0) -> int:
     try:
-        # tolerate "0.0"
         return int(float(x))
     except Exception:
         return default
@@ -74,10 +69,13 @@ def _safe_bool(x, default: bool = False) -> bool:
     return default
 
 
+def _Eh_to_kcal(E_h: float) -> float:
+    return float(E_h * EH_TO_KCAL)
+
+
 def _load_attempted_conformers(per_conf_csv: str) -> Dict[str, Dict[str, str]]:
     """
     Load a map tag -> last-seen CSV row for conformers that have been attempted.
-    'Attempted' means: there exists any row in the per-conformer CSV for that tag.
     """
     if (not per_conf_csv) or (not os.path.exists(per_conf_csv)):
         return {}
@@ -86,7 +84,7 @@ def _load_attempted_conformers(per_conf_csv: str) -> Dict[str, Dict[str, str]]:
     try:
         with open(per_conf_csv, "r", newline="") as f:
             reader = csv.DictReader(f)
-            if reader.fieldnames is None:
+            if not reader.fieldnames:
                 return {}
             for row in reader:
                 tag = (row.get("tag") or "").strip()
@@ -110,24 +108,23 @@ def _gaussian_write_gjf(
     mem: str = "16GB",
     nproc: str = "8",
 ):
-    """
-    Minimal Gaussian input writer.
-    """
     chk = os.path.splitext(os.path.basename(path))[0] + ".chk"
-    lines = []
-    lines.append(f"%chk={chk}")
-    lines.append(f"%mem={mem}")
-    lines.append(f"%nprocshared={nproc}")
-    lines.append(f"# {route}")
-    lines.append("")  # blank
-    lines.append(os.path.basename(path))
-    lines.append("")  # blank
-    lines.append(f"{charge} {mult}")
     syms = atoms.get_chemical_symbols()
     pos = atoms.get_positions()
+
+    lines: List[str] = [
+        f"%chk={chk}",
+        f"%mem={mem}",
+        f"%nprocshared={nproc}",
+        f"# {route}",
+        "",
+        os.path.basename(path),
+        "",
+        f"{charge} {mult}",
+    ]
     for s, (x, y, z) in zip(syms, pos):
         lines.append(f" {s:<2s}   {x: .8f}  {y: .8f}  {z: .8f}")
-    lines.append("\n")  # Gaussian likes an ending blank line
+    lines.append("")  # Gaussian likes a final blank line
     with open(path, "w") as f:
         f.write("\n".join(lines))
 
@@ -171,10 +168,12 @@ def _minimize_atoms_inplace(
             gamma=s.gamma,
             delta0=s.delta0,
         )
+
         cuts = gaussian_cutoffs(mode=opt_mode)
         prev_pos = None
         converged, steps = False, 0
         t_start = time.perf_counter()
+
         for i in range(1, maxcycles + 1):
             steps = i
             opt.step()
@@ -186,6 +185,7 @@ def _minimize_atoms_inplace(
                 converged = True
                 break
             prev_pos = curr_pos.copy()
+
         wall = time.perf_counter() - t_start
         E_h = _sp_energy_Eh(atoms)
         LOG.info(
@@ -197,45 +197,46 @@ def _minimize_atoms_inplace(
         )
         return converged, steps, E_h
 
-    else:
-        from ase.optimize import LBFGS, BFGS, BFGSLineSearch, FIRE, QuasiNewton
+    from ase.optimize import LBFGS, BFGS, BFGSLineSearch, FIRE, QuasiNewton
 
-        OPT = {
-            "LBFGS": LBFGS,
-            "BFGS": BFGS,
-            "BFGSLineSearch": BFGSLineSearch,
-            "FIRE": FIRE,
-            "QuasiNewton": QuasiNewton,
-        }[optimizer]
-        LOG.info(
-            "  [OPT] %s (opt_mode=%s) — maxcycles=%d", optimizer, opt_mode, maxcycles
-        )
-        cuts = gaussian_cutoffs(mode=opt_mode)
-        ase_fmax = 1e-12
-        dyn = OPT(atoms, trajectory=None, logfile=None)
-        prev_pos = None
-        converged, steps = False, 0
-        t_start = time.perf_counter()
-        for i, _ in enumerate(dyn.irun(fmax=ase_fmax, steps=maxcycles), start=1):
-            steps = i
-            forces = atoms.get_forces()
-            grms, gmax = force_metrics_HB(forces)
-            curr_pos = atoms.get_positions()
-            drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
-            if gaussian_converged(grms, gmax, drms, dmax, cuts):
-                converged = True
-                break
-            prev_pos = curr_pos.copy()
-        wall = time.perf_counter() - t_start
-        E_h = _sp_energy_Eh(atoms)
-        LOG.info(
-            "  [OPT] Done: conv=%s | steps=%d | E=%.8f Eh | wall=%.2fs",
-            converged,
-            steps,
-            E_h,
-            wall,
-        )
-        return converged, steps, E_h
+    OPT = {
+        "LBFGS": LBFGS,
+        "BFGS": BFGS,
+        "BFGSLineSearch": BFGSLineSearch,
+        "FIRE": FIRE,
+        "QuasiNewton": QuasiNewton,
+    }[optimizer]
+
+    LOG.info("  [OPT] %s (opt_mode=%s) — maxcycles=%d", optimizer, opt_mode, maxcycles)
+    cuts = gaussian_cutoffs(mode=opt_mode)
+    ase_fmax = 1e-12  # we do our own convergence checks
+    dyn = OPT(atoms, trajectory=None, logfile=None)
+
+    prev_pos = None
+    converged, steps = False, 0
+    t_start = time.perf_counter()
+
+    for i, _ in enumerate(dyn.irun(fmax=ase_fmax, steps=maxcycles), start=1):
+        steps = i
+        forces = atoms.get_forces()
+        grms, gmax = force_metrics_HB(forces)
+        curr_pos = atoms.get_positions()
+        drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
+        if gaussian_converged(grms, gmax, drms, dmax, cuts):
+            converged = True
+            break
+        prev_pos = curr_pos.copy()
+
+    wall = time.perf_counter() - t_start
+    E_h = _sp_energy_Eh(atoms)
+    LOG.info(
+        "  [OPT] Done: conv=%s | steps=%d | E=%.8f Eh | wall=%.2fs",
+        converged,
+        steps,
+        E_h,
+        wall,
+    )
+    return converged, steps, E_h
 
 
 def _ts_optimize_atoms_inplace(
@@ -262,6 +263,7 @@ def _ts_optimize_atoms_inplace(
         gamma=s.gamma,
         delta0=s.delta0,
     )
+
     cuts = gaussian_cutoffs(mode="Normal")
     prev_pos = None
     converged, steps = False, 0
@@ -292,21 +294,15 @@ def _ts_optimize_atoms_inplace(
         return converged, steps, E_h
 
     except np.linalg.LinAlgError as e:
-        # This catches "SVD did not converge in Linear Least Squares" and similar
         LOG.exception(
-            "  [TS ] Linear algebra failure in Sella (likely SVD issue); "
-            "marking conformer as unconverged and continuing. %s",
-            e,
+            "  [TS ] Linear algebra failure in Sella; marking unconverged. %s", e
         )
     except Exception as e:
-        # Catch anything else so we don't kill the whole ensemble
         LOG.exception(
-            "  [TS ] Unexpected exception in TS optimization; "
-            "marking conformer as unconverged and continuing. %s",
+            "  [TS ] Unexpected exception in TS optimization; marking unconverged. %s",
             e,
         )
 
-    # Fallback path after an exception: best-effort energy + bookkeeping
     wall = time.perf_counter() - t_start
     try:
         E_h = _sp_energy_Eh(atoms)
@@ -323,26 +319,8 @@ def _ts_optimize_atoms_inplace(
 
 
 # -----------------------
-# Worker processes
+# Main workflow
 # -----------------------
-def _bind_gpu_env(gpu_id: int, scratch_root: str):
-    # Bind to a single GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    # Per-GPU scratch root for ASE vib cache etc.
-    os.environ.setdefault(
-        "UMA_SCRATCH_ROOT", os.path.join(scratch_root, f"_gpu{gpu_id}")
-    )
-
-
-def _rebuild_atoms(
-    symbols: List[str], positions: np.ndarray, charge: int, mult: int
-) -> Atoms:
-    a = Atoms(symbols=symbols, positions=positions, pbc=False)
-    a.info.update({"charge": charge, "spin": mult})
-    return a
-
-
 def run_conformer_workflow(
     xyz_path: str,
     out_dir: str,
@@ -362,6 +340,9 @@ def run_conformer_workflow(
     maxcycles: int = 300,
     # frequency / thermo
     do_freq: bool = False,
+    freq_ts: Optional[
+        bool
+    ] = None,  # NEW: True=TS freq, False=GS freq, None=auto from route
     freq_delta: float = 0.01,
     freq_nfree: int = 2,
     freq_scale: float = 1.0,
@@ -374,8 +355,8 @@ def run_conformer_workflow(
     cutoff_cm1: Optional[float] = None,
     qrrho_ref_cm1: float = 100.0,
     qrrho_alpha: float = 4.0,
-    # NEW: concentration-aware thermo
-    conc_mol_L: Optional[float] = None,  # <--- NEW
+    # concentration-aware thermo
+    conc_mol_L: Optional[float] = None,
     # solvation
     solv: Optional[str] = None,
     gauss_mem: str = "16GB",
@@ -388,51 +369,61 @@ def run_conformer_workflow(
     # IRC
     irc: bool = False,
     irc_dx: float = 0.1,
-    # If provided by batch layer we’ll use it; otherwise build once here
+    # Optional calculator injection
     calc: Optional[object] = None,
-    # NEW: Resume PHASE 1 by skipping tags present in energies_per_conformer_{job_tag}.csv
-    # Skip means: do not re-run PHASE 1 even if the previous attempt failed.
+    # Resume PHASE 1 by skipping tags present in per-conformer CSV
     resume_from_per_conformer_csv: bool = False,
 ) -> str:
     """
     Serial conformer workflow (ensemble-level parallelism happens in batch.py):
-      (1) OPT/SP/TS — serial over conformers
+      (1) OPT/SP/TS — serial over conformers (original order)
       (2) Write Gaussian inputs (original order)
-      (3) FREQ — serial over conformers (original order)
+      (3) FREQ + thermo — serial over conformers (original order)
       (4) IRC — serial (original order)
     Returns energies.csv path.
 
     Resume behavior (if resume_from_per_conformer_csv=True):
-      - If a conformer tag appears in energies_per_conformer_{job_tag}.csv, PHASE 1 is skipped
-        for that conformer, regardless of convergence status.
-      - Skipped conformers attempt to reload per_struct_{job_tag}/{job_tag}_{tag}.xyz to supply
-        a structure to later phases; if missing, atoms=None and later phases will skip.
+      - If tag appears in energies_per_conformer_{job_tag}.csv, PHASE 1 is skipped (even if failed).
+      - Skipped conformers attempt to reload per_struct_{job_tag}/{job_tag}_{tag}.xyz for downstream.
     """
     job_tag = os.path.splitext(os.path.basename(xyz_path))[0]
-
     t0 = time.perf_counter()
+
     _ensure_dir(out_dir)
     per_conf_dir = os.path.join(out_dir, f"per_struct_{job_tag}")
     _ensure_dir(per_conf_dir)
 
     per_conf_csv = os.path.join(out_dir, f"energies_per_conformer_{job_tag}.csv")
-    LOG.info(
-        "[RESUME] per_conf_csv=%s exists=%s", per_conf_csv, os.path.exists(per_conf_csv)
-    )
     attempted_rows = (
         _load_attempted_conformers(per_conf_csv)
         if resume_from_per_conformer_csv
         else {}
     )
     LOG.info(
-        "[RESUME] resume=%s attempted_rows=%d",
+        "[RESUME] resume=%s attempted_rows=%d per_conf_csv=%s",
         resume_from_per_conformer_csv,
         len(attempted_rows),
+        per_conf_csv,
     )
+
+    # Decide route kind (primarily for logging + defaults)
+    if optts:
+        route_kind = "TS"
+    elif optimizer is None:
+        route_kind = "SP"
+    else:
+        route_kind = "OPT"
+
+    # Scratch for vibrations etc.
+    scratch_root = os.environ.get("UMA_SCRATCH_ROOT", cache_dir or out_dir)
+    job_scratch = make_job_scratch(scratch_root, f"ensemble-{job_tag}")
+    _ensure_dir(job_scratch)
 
     LOG.info("=== Ensemble workflow (serial) ===")
     LOG.info("Input: %s", xyz_path)
     LOG.info("Outdir: %s", out_dir)
+    LOG.info("Route kind: %s", route_kind)
+    LOG.info("Scratch: %s", job_scratch)
 
     frames: List[Atoms] = ase_read(xyz_path, index=":")
     n = len(frames)
@@ -440,29 +431,7 @@ def run_conformer_workflow(
         raise RuntimeError("No frames found in input XYZ.")
     LOG.info("Loaded %d conformers", n)
 
-    if resume_from_per_conformer_csv:
-        LOG.info(
-            "Resume enabled (per-conformer CSV): found %d previously attempted conformers in %s",
-            len(attempted_rows),
-            per_conf_csv,
-        )
-
-    # Decide route
-    if optts:
-        route_kind = "TS"
-    elif optimizer is None:
-        route_kind = "SP"
-    else:
-        route_kind = "OPT"
-    LOG.info("Route kind: %s", route_kind)
-
-    # Scratch for vibrations etc.
-    scratch_root = os.environ.get("UMA_SCRATCH_ROOT", cache_dir or out_dir)
-    job_scratch = make_job_scratch(scratch_root, f"ensemble-{job_tag}")
-    _ensure_dir(job_scratch)
-    LOG.info("Scratch: %s", job_scratch)
-
-    # Build calculator once if not provided by caller
+    # Build calculator once if not provided
     if calc is None:
         dev = resolve_device(device)
         LOG.info(
@@ -478,10 +447,9 @@ def run_conformer_workflow(
             use_local_scratch=use_local_scratch,
         )
     else:
-        # Best-effort device label for banners
-        dev = device
+        dev = device  # best-effort label
 
-    # Sella options
+    # Sella options object reused for all conformers
     sella = SellaOpts(
         internal=sella_internal,
         order=(1 if optts else 0),
@@ -490,62 +458,96 @@ def run_conformer_workflow(
         delta0=sella_delta0,
     )
 
+    # Prepare per-conformer CSV writer (append + flush each row)
+    per_conf_fields = [
+        "index",
+        "tag",
+        "route",
+        "converged",
+        "steps",
+        "energy_Eh",
+        "energy_kcal",
+    ]
+    per_conf_write_header = (not os.path.exists(per_conf_csv)) or (
+        os.path.getsize(per_conf_csv) == 0
+    )
+    per_conf_f = open(per_conf_csv, "a", newline="")
+    per_conf_w = csv.DictWriter(per_conf_f, fieldnames=per_conf_fields)
+    if per_conf_write_header:
+        per_conf_w.writeheader()
+        per_conf_f.flush()
+
+    def _append_per_conf_row(
+        idx: int, tag: str, route: str, converged: bool, steps: int, E_h: float
+    ):
+        try:
+            per_conf_w.writerow(
+                dict(
+                    index=idx,
+                    tag=tag,
+                    route=route,
+                    converged=bool(converged),
+                    steps=int(steps),
+                    energy_Eh=float(E_h),
+                    energy_kcal=_Eh_to_kcal(float(E_h)),
+                )
+            )
+            per_conf_f.flush()
+        except Exception as e:
+            LOG.exception(
+                "  [DUMP] Failed to append per-conformer CSV row for %s: %s", tag, e
+            )
+
     # -----------------------
     # PHASE 1: OPT/SP/TS (serial; ORIGINAL ORDER)
     # -----------------------
-    LOG.info("PHASE 1: Starting OPT/SP/TS for %d conformers", n)
-    conformers: List[Dict] = []
+    LOG.info("PHASE 1: OPT/SP/TS for %d conformers (original order)", n)
+    conformers: List[Dict[str, Any]] = []
+
     for idx, src in enumerate(frames):
         tag = f"conf_{idx:04d}"
         LOG.info("--- Conformer %d/%d | tag=%s ---", idx + 1, n, tag)
 
-        # Resume logic: skip if tag exists in per-conformer CSV (attempted before),
-        # regardless of converged/failure status.
+        # Resume skip logic (skip PHASE 1 if tag already present)
         if resume_from_per_conformer_csv and (tag in attempted_rows):
             row = attempted_rows[tag]
+            prev_route = (row.get("route") or route_kind).strip() or route_kind
             E_h = _safe_float(row.get("energy_Eh"))
             steps = _safe_int(row.get("steps"), default=0)
             converged = _safe_bool(row.get("converged"), default=False)
-            prev_route = row.get("route") or route_kind
 
             LOG.info(
-                "  [RESUME] %s found in per-conformer CSV; skipping PHASE 1. "
-                "(prev: route=%s converged=%s steps=%d E=%.8f Eh)",
-                tag,
+                "  [RESUME] skipping PHASE 1 (prev: route=%s converged=%s steps=%d E=%.8f Eh)",
                 prev_route,
                 converged,
                 steps,
                 E_h,
             )
 
-            # Best-effort reload of the previously written structure for downstream phases.
+            # Reload structure for downstream phases if available
             a = None
             conf_xyz_path = os.path.join(per_conf_dir, f"{job_tag}_{tag}.xyz")
-            try:
-                if os.path.exists(conf_xyz_path):
+            if os.path.exists(conf_xyz_path):
+                try:
                     a = ase_read(conf_xyz_path)
                     a.pbc = False
                     a.info.update({"charge": charge, "spin": mult})
                     a.calc = calc
-                else:
-                    LOG.warning(
-                        "  [RESUME] %s: per-conformer XYZ missing (%s); "
-                        "downstream phases will skip this conformer.",
-                        tag,
-                        conf_xyz_path,
+                except Exception as e:
+                    LOG.exception(
+                        "  [RESUME] %s: failed to load %s: %s", tag, conf_xyz_path, e
                     )
-            except Exception as e:
-                LOG.exception(
-                    "  [RESUME] %s: failed to load per-conformer XYZ (%s): %s; "
-                    "downstream phases will skip this conformer.",
+                    a = None
+            else:
+                LOG.warning(
+                    "  [RESUME] %s: missing %s; downstream phases will skip.",
                     tag,
                     conf_xyz_path,
-                    e,
                 )
-                a = None
 
+            # Energy kcal: prefer Eh-derived; fall back to stored kcal if Eh is nan
             if np.isfinite(E_h):
-                E_kcal = float(E_h * EV_PER_HARTREE * KCAL_PER_MOL_PER_EV)
+                E_kcal = _Eh_to_kcal(E_h)
             else:
                 E_kcal = _safe_float(row.get("energy_kcal"))
 
@@ -567,6 +569,7 @@ def run_conformer_workflow(
             )
             continue
 
+        # Fresh run
         a = src.copy()
         a.pbc = False
         a.info.update({"charge": charge, "spin": mult})
@@ -584,33 +587,33 @@ def run_conformer_workflow(
         else:
             converged, steps, E_h = _minimize_atoms_inplace(
                 a,
-                optimizer=optimizer,
+                optimizer=optimizer,  # type: ignore[arg-type]
                 opt_mode=opt_mode,
                 maxcycles=maxcycles,
                 sella=sella if optimizer == "Sella" else None,
             )
 
-        conformers.append(
-            dict(
-                index=idx,
-                tag=tag,
-                atoms=a,
-                route=route_kind,
-                converged=bool(converged),
-                steps=int(steps),
-                energy_Eh=float(E_h),
-                energy_kcal=float(E_h * EV_PER_HARTREE * KCAL_PER_MOL_PER_EV),
-                gibbs_Eh=None,
-                gibbs_kcal=None,
-                n_imag=None,
-                imag_ok=None,
-            )
+        rec = dict(
+            index=idx,
+            tag=tag,
+            atoms=a,
+            route=route_kind,
+            converged=bool(converged),
+            steps=int(steps),
+            energy_Eh=float(E_h),
+            energy_kcal=_Eh_to_kcal(float(E_h)),
+            gibbs_Eh=None,
+            gibbs_kcal=None,
+            n_imag=None,
+            imag_ok=None,
         )
+        conformers.append(rec)
+
         LOG.info(
             "  Summary: E=%.8f Eh | converged=%s | steps=%d", E_h, converged, steps
         )
 
-        # write per-conformer optimized structure immediately
+        # Write per-conformer XYZ
         try:
             conf_xyz_path = os.path.join(per_conf_dir, f"{job_tag}_{tag}.xyz")
             ase_write(conf_xyz_path, a, format="xyz", parallel=False)
@@ -619,64 +622,32 @@ def run_conformer_workflow(
                 "  [DUMP] Failed to write per-conformer XYZ for %s: %s", tag, e
             )
 
-        # write per-conformer to CSV
-        try:
-            write_header = (not os.path.exists(per_conf_csv)) or (
-                os.path.getsize(per_conf_csv) == 0
-            )
-            with open(per_conf_csv, "a", newline="") as f:
-                w = csv.DictWriter(
-                    f,
-                    fieldnames=[
-                        "index",
-                        "tag",
-                        "route",
-                        "converged",
-                        "steps",
-                        "energy_Eh",
-                        "energy_kcal",
-                    ],
-                )
-                if write_header:
-                    w.writeheader()
-                w.writerow(
-                    dict(
-                        index=idx,
-                        tag=tag,
-                        route=route_kind,
-                        converged=bool(converged),
-                        steps=int(steps),
-                        energy_Eh=float(E_h),
-                        energy_kcal=float(E_h * EV_PER_HARTREE * KCAL_PER_MOL_PER_EV),
-                    )
-                )
-        except Exception as e:
-            LOG.exception(
-                "  [DUMP] Failed to append per-conformer CSV row for %s: %s", tag, e
-            )
+        # Append per-conformer CSV row
+        _append_per_conf_row(idx, tag, route_kind, converged, steps, E_h)
+
+    # Close per-conf CSV handle
+    try:
+        per_conf_f.close()
+    except Exception:
+        pass
 
     LOG.info("PHASE 1: Completed.")
 
-    # Rank for reporting (keep original order for subsequent steps)
+    # -----------------------
+    # Ranking (by electronic energy)
+    # -----------------------
     LOG.info("Ranking by electronic energy …")
 
-    def _energy_sort_key(r: Dict) -> Tuple[int, float]:
-        E = r.get("energy_Eh", float("nan"))
-        try:
-            E = float(E)
-        except Exception:
-            return (1, 0.0)
+    def _sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
+        E = _safe_float(r.get("energy_Eh"))
         return (0, E) if np.isfinite(E) else (1, 0.0)
 
-    results_sorted = sorted(conformers, key=_energy_sort_key)
+    results_sorted = sorted(conformers, key=_sort_key)
 
-    # establish reference energy e0 from first finite entry
+    # Reference energy e0 from first finite entry
     e0 = None
     for r in results_sorted:
-        try:
-            E = float(r.get("energy_Eh", float("nan")))
-        except Exception:
-            continue
+        E = _safe_float(r.get("energy_Eh"))
         if np.isfinite(E):
             e0 = E
             break
@@ -686,24 +657,13 @@ def run_conformer_workflow(
         )
 
     for r in results_sorted:
-        try:
-            E = float(r.get("energy_Eh", float("nan")))
-        except Exception:
-            E = float("nan")
-        if np.isfinite(E):
-            r["rel_kcal"] = (E - e0) * EV_PER_HARTREE * KCAL_PER_MOL_PER_EV
-        else:
-            r["rel_kcal"] = float("nan")
+        E = _safe_float(r.get("energy_Eh"))
+        r["rel_kcal"] = (E - e0) * EH_TO_KCAL if np.isfinite(E) else float("nan")
 
     ranked_xyz_path = os.path.join(out_dir, "optimized_ranked.xyz")
     ranked_atoms = [r["atoms"] for r in results_sorted if r.get("atoms") is not None]
     if ranked_atoms:
-        ase_write(
-            ranked_xyz_path,
-            ranked_atoms,
-            format="xyz",
-            parallel=False,
-        )
+        ase_write(ranked_xyz_path, ranked_atoms, format="xyz", parallel=False)
         LOG.info("Wrote ranked XYZ: %s", ranked_xyz_path)
     else:
         LOG.warning("No structures available to write ranked XYZ: %s", ranked_xyz_path)
@@ -716,7 +676,7 @@ def run_conformer_workflow(
         _ensure_dir(gjf_dir)
         LOG.info("PHASE 2: Writing Gaussian inputs (original order) …")
         for r in conformers:
-            a, tag = r["atoms"], r["tag"]
+            a, tag = r.get("atoms"), r.get("tag")
             if a is None:
                 LOG.warning("  [GJF] %s skipped (no structure)", tag)
                 continue
@@ -744,20 +704,29 @@ def run_conformer_workflow(
         LOG.info("PHASE 2: Completed.")
 
     # -----------------------
-    # PHASE 3: Frequencies (serial; ORIGINAL ORDER)
+    # PHASE 3: Frequencies + thermo (serial; ORIGINAL ORDER)
     # -----------------------
     if do_freq:
         freq_dir = os.path.join(out_dir, "freq_out")
         _ensure_dir(freq_dir)
         LOG.info("PHASE 3: Frequencies (original order) …")
+
         for r in conformers:
-            if r["atoms"] is None:
+            a = r.get("atoms")
+            if a is None:
                 continue
-            a, tag, route_kind, E_h = r["atoms"], r["tag"], r["route"], r["energy_Eh"]
+
+            tag = r["tag"]
+            route_used = r.get("route", route_kind)
+            E_h = _safe_float(r.get("energy_Eh"))
+
             out_path = os.path.join(freq_dir, f"{tag}.out")
             LOG.info("  [FRQ] %s → %s", tag, out_path)
+
             writer = ORCAWriter(out_path, xyz_path, model, dev, opt_banner=False)
             try:
+                ts_flag = freq_ts if freq_ts is not None else (route_used == "TS")
+
                 freqs = run_frequencies_and_write(
                     writer,
                     a,
@@ -765,15 +734,15 @@ def run_conformer_workflow(
                     nfree=freq_nfree,
                     scale=freq_scale,
                     scratch_dir=os.path.join(job_scratch, tag),
-                    ts=(route_kind == "TS"),
+                    ts=ts_flag,
                 )
-                n_imag = sum(1 for f in freqs if f < 0.0)
-                imag_ok = n_imag == (1 if route_kind == "TS" else 0)
 
-                # freqs returned by run_frequencies_and_write are already scaled by freq_scale
+                n_imag = sum(1 for f in freqs if f < 0.0)
+                imag_ok = n_imag == (1 if ts_flag else 0)
+
                 th = rrho_thermo(
                     a,
-                    freqs,  # already scaled; do NOT multiply again
+                    freqs,  # already scaled by run_frequencies_and_write
                     temp,
                     pressure_atm,
                     symmetry_number,
@@ -786,7 +755,7 @@ def run_conformer_workflow(
                     solv=solv,
                     multiplicity=mult,
                 )
-                G_Eh = th["G_total_Eh"]
+                G_Eh = float(th["G_total_Eh"])
 
                 writer.write_thermochemistry(
                     T=temp,
@@ -818,8 +787,8 @@ def run_conformer_workflow(
                 writer.write_termination(0.0)
                 writer.close()
 
-                r["gibbs_Eh"] = float(G_Eh)
-                r["gibbs_kcal"] = float(G_Eh * EV_PER_HARTREE * KCAL_PER_MOL_PER_EV)
+                r["gibbs_Eh"] = G_Eh
+                r["gibbs_kcal"] = _Eh_to_kcal(G_Eh)
                 r["n_imag"] = int(n_imag)
                 r["imag_ok"] = bool(imag_ok)
 
@@ -829,6 +798,7 @@ def run_conformer_workflow(
                 except Exception:
                     pass
                 LOG.exception("  [FRQ] %s failed: %s", tag, e)
+
         LOG.info("PHASE 3: Completed.")
 
     # -----------------------
@@ -838,23 +808,31 @@ def run_conformer_workflow(
         irc_dir = os.path.join(out_dir, "irc")
         _ensure_dir(irc_dir)
         LOG.info("PHASE 4: IRC (serial) …")
+
         from .irc import run_irc_trajectories
 
         for r in conformers:
-            if r["atoms"] is None:
+            a = r.get("atoms")
+            if a is None:
                 continue
-            a, tag, route_kind = r["atoms"], r["tag"], r["route"]
-            run_this = False
+
+            tag = r["tag"]
+            route_used = r.get("route", route_kind)
+
+            # Keep your previous semantics:
+            # - If TS optimization requested: require imag_ok (if freq ran), otherwise run.
+            # - Otherwise: run IRC unconditionally (user asked for it).
+            run_this = True
             if optts:
                 if do_freq:
-                    run_this = r.get("imag_ok", None) is True
+                    run_this = r.get("imag_ok") is True
                 else:
                     run_this = True
-            else:
-                run_this = True
+
             if not run_this:
                 LOG.info("  [IRC] %s: skip (not TS with 1 imaginary)", tag)
                 continue
+
             try:
                 run_irc_trajectories(
                     a,
@@ -874,8 +852,10 @@ def run_conformer_workflow(
                 LOG.exception("  [IRC] %s failed: %s", tag, e)
 
     # -----------------------
-    # CSV (ranked), with freq cols pulled from original rows
+    # energies.csv (ranked)
     # -----------------------
+    by_tag: Dict[str, Dict[str, Any]] = {c["tag"]: c for c in conformers}
+
     csv_path = os.path.join(out_dir, "energies.csv")
     fieldnames = [
         "rank",
@@ -896,25 +876,26 @@ def run_conformer_workflow(
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for rank, r in enumerate(results_sorted, start=1):
-            # find original row by tag to get any freq results
-            match = next((x for x in conformers if x["tag"] == r["tag"]), r)
+            tag = r["tag"]
+            match = by_tag.get(tag, r)
             w.writerow(
                 dict(
                     rank=rank,
                     index=r["index"],
-                    tag=r["tag"],
-                    route=r["route"],
-                    converged=r["converged"],
-                    steps=r["steps"],
-                    energy_Eh=r["energy_Eh"],
-                    energy_kcal=r["energy_kcal"],
-                    rel_kcal=r["rel_kcal"],
-                    gibbs_Eh=match["gibbs_Eh"],
-                    gibbs_kcal=match["gibbs_kcal"],
-                    n_imag=match["n_imag"],
-                    imag_ok=match["imag_ok"],
+                    tag=tag,
+                    route=r.get("route", route_kind),
+                    converged=r.get("converged"),
+                    steps=r.get("steps"),
+                    energy_Eh=r.get("energy_Eh"),
+                    energy_kcal=r.get("energy_kcal"),
+                    rel_kcal=r.get("rel_kcal"),
+                    gibbs_Eh=match.get("gibbs_Eh"),
+                    gibbs_kcal=match.get("gibbs_kcal"),
+                    n_imag=match.get("n_imag"),
+                    imag_ok=match.get("imag_ok"),
                 )
             )
+
     LOG.info("Wrote energies CSV: %s", csv_path)
     LOG.info("Ensemble workflow complete in %.2fs", time.perf_counter() - t0)
     return csv_path

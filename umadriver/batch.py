@@ -1,6 +1,13 @@
 # umadriver/batch.py
 from __future__ import annotations
-import os, glob, logging, json, multiprocessing as mp, queue
+
+import os
+import sys
+import glob
+import logging
+import json
+import multiprocessing as mp
+import queue
 from typing import Any, Dict, List, Optional, Iterable
 from dataclasses import dataclass
 
@@ -22,7 +29,9 @@ from .ensemble import run_conformer_workflow, _ensure_dir
 @dataclass
 class BatchCommon:
     model: str = "uma-m-1p1"
-    device: str = "cuda"  # "cuda" | "cpu"
+    device: str = (
+        "cuda"  # "cuda" | "cpu" | "auto" (auto treated like cuda if GPUs exist)
+    )
     cache_dir: Optional[str] = None
     use_local_scratch: bool = False
     out_root: str = "runs"
@@ -41,15 +50,19 @@ def _load_manifest(path: str) -> Dict[str, Any]:
 
 
 def _job_out_dir(out_root: str, xyz_path: str, explicit: Optional[str]) -> str:
+    """
+    Default: <out_root>/<stem>.ensemble unless explicit out_dir is provided.
+    """
     if explicit:
         return explicit
     base = os.path.splitext(os.path.basename(xyz_path))[0]
-    return os.path.join(out_root, base)
+    return os.path.join(out_root, base + ".ensemble")
 
 
 def _expand_xyz_inputs(xyz_list: Iterable[str]) -> List[str]:
     out: List[str] = []
     for s in xyz_list:
+        # If user quoted globs, expand here; if shell expanded already, we just get filenames.
         if any(ch in s for ch in "*?[]"):
             out.extend(sorted(glob.glob(s)))
         else:
@@ -69,11 +82,17 @@ def _parse_visible_devices_env() -> Optional[List[int]]:
 
 
 def _discover_gpus(device: str) -> List[int]:
+    """
+    Returns a list of GPU ids visible to this process.
+    If device is cpu -> [].
+    """
     if device.lower() == "cpu":
         return []
+
     env_ids = _parse_visible_devices_env()
     if env_ids is not None:
         return env_ids
+
     try:
         import torch
 
@@ -84,11 +103,14 @@ def _discover_gpus(device: str) -> List[int]:
 
 
 def _bind_gpu_env(gpu_id: int, out_root: str):
-    # Bind this child process to exactly one GPU.
+    """
+    Bind this child process to exactly one GPU.
+    Also shard scratch if UMA_SCRATCH_ROOT is not already set.
+    """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    # Optional: per-GPU scratch segregation to reduce cache contention.
-    # If UMA_SCRATCH_ROOT is already set by the user, keep it; otherwise shard by GPU.
+
+    # If user did not specify UMA_SCRATCH_ROOT, shard by GPU to reduce contention.
     if "UMA_SCRATCH_ROOT" not in os.environ:
         os.environ["UMA_SCRATCH_ROOT"] = os.path.join(out_root, f"_gpu{gpu_id}_scratch")
 
@@ -97,18 +119,20 @@ def _bind_gpu_env(gpu_id: int, out_root: str):
 # Worker
 # =========================
 def _worker_loop(
-    gpu_id: int, task_q: mp.Queue, result_q: mp.Queue, common: Dict[str, Any]
+    gpu_id: int,
+    task_q: mp.Queue,
+    result_q: mp.Queue,
+    common: Dict[str, Any],
 ):
     """
     Each worker:
       - pins to a single GPU
       - processes a stream of jobs (each job is one ensemble XYZ)
-      - builds nothing global in the parent; run_conformer_workflow handles calc internally
+      - run_conformer_workflow constructs its own calculator internally (unless injected)
     """
     from .utils import setup_logging
 
     setup_logging(verbose=True, debug=False)
-
     _bind_gpu_env(gpu_id, common["out_root"])
     LOG.info("[GPU %d] worker start", gpu_id)
 
@@ -124,8 +148,14 @@ def _worker_loop(
 
         xyz = job["xyz"]
         out_dir = job["out_dir"]
-        overrides = job.get("overrides", {})
-        resume = job["resume"]
+        overrides = (job.get("overrides", {}) or {}).copy()
+        resume = bool(job.get("resume", True))
+
+        # Avoid keyword collisions: allow this to be set either in overrides or in common
+        resume_from_per_conf = overrides.pop(
+            "resume_from_per_conformer_csv",
+            common.get("resume_from_per_conformer_csv", False),
+        )
 
         try:
             energies_csv = os.path.join(out_dir, "energies.csv")
@@ -136,20 +166,19 @@ def _worker_loop(
 
             _ensure_dir(out_dir)
             LOG.info("[GPU %d] RUN: %s → %s", gpu_id, xyz, out_dir)
-            # NOTE: do NOT pass a calculator object; each job constructs its own inside ensemble.py
+
             run_conformer_workflow(
                 xyz,
                 out_dir,
                 model=common["model"],
                 device="cuda",
-                cache_dir=common["cache_dir"],
-                use_local_scratch=common["use_local_scratch"],
-                resume_from_per_conformer_csv=common.get(
-                    "resume_from_per_conformer_csv", False
-                ),
+                cache_dir=common.get("cache_dir"),
+                use_local_scratch=common.get("use_local_scratch", False),
+                resume_from_per_conformer_csv=resume_from_per_conf,
                 **overrides,
             )
             result_q.put({"xyz": xyz, "out_dir": out_dir, "status": "ok"})
+
         except Exception as e:
             LOG.exception("[GPU %d] Job failed: %s", gpu_id, e)
             result_q.put({"xyz": xyz, "out_dir": out_dir, "status": f"error: {e}"})
@@ -163,14 +192,20 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
     try:
         common_cfg = cfg.get("common", {})
     except AttributeError:
-        print("Did you forget 'jobs'\ at the beginning of the yaml file?")
+        print(
+            "Manifest parse error. Expected top-level mapping with 'jobs:' and optional 'common:'."
+        )
         sys.exit(1)
+
     jobs_cfg = cfg.get("jobs", [])
+    if not isinstance(jobs_cfg, list):
+        raise RuntimeError("Manifest 'jobs' must be a list.")
 
     # Merge CLI overrides -> manifest common -> BatchCommon
     merged = {**common.__dict__, **common_cfg, **cli_overrides}
+
     model = merged["model"]
-    device = merged["device"]
+    device = merged.get("device", "cuda")
     cache_dir = merged.get("cache_dir")
     use_local_scratch = merged.get("use_local_scratch", False)
     out_root = merged.get("out_root", "runs")
@@ -186,26 +221,26 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
         resume,
     )
 
-    # Prepare job list (resolve out_dir now; also filter resumed ones later)
+    # Prepare job list (resolve out_dir now)
     jobs: List[Dict[str, Any]] = []
     for j in jobs_cfg:
         xyz = j["xyz"]
         out_dir = _job_out_dir(out_root, xyz, j.get("out_dir"))
-        overrides = j.get("overrides", {})
+        overrides = (j.get("overrides", {}) or {}).copy()
         jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides})
 
     return _run_parallel_jobs(jobs, merged)
 
 
 def run_batch_from_glob(xyz_glob: List[str], common: BatchCommon, **overrides):
-    # Expand globs
     xyz_paths = _expand_xyz_inputs(xyz_glob)
     if not xyz_paths:
         raise RuntimeError("No inputs matched.")
 
     merged = {**common.__dict__, **overrides}
+
     model = merged["model"]
-    device = merged["device"]
+    device = merged.get("device", "cuda")
     cache_dir = merged.get("cache_dir")
     out_root = merged.get("out_root", "runs")
     resume = merged.get("resume", True)
@@ -241,20 +276,23 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
     cache_dir = merged_common.get("cache_dir")
     model = merged_common.get("model", "uma-m-1p1")
     use_local_scratch = merged_common.get("use_local_scratch", False)
+    resume_from_per_common = merged_common.get("resume_from_per_conformer_csv", False)
 
-    # Materialize job list with resume flag
-    jobs = []
-    skipped_summary = []
+    # Materialize job list with resume flag; skip already-done jobs
+    jobs: List[Dict[str, Any]] = []
+    skipped_summary: List[Dict[str, str]] = []
     for j in jobs_in:
         xyz = j["xyz"]
         out_dir = j["out_dir"]
-        overrides = j.get("overrides", {})
+        overrides = (j.get("overrides", {}) or {}).copy()
+
         if resume and os.path.isfile(os.path.join(out_dir, "energies.csv")):
             LOG.info("Skipping (resume): %s", out_dir)
             skipped_summary.append(
                 {"xyz": xyz, "out_dir": out_dir, "status": "skipped"}
             )
             continue
+
         jobs.append(
             {"xyz": xyz, "out_dir": out_dir, "overrides": overrides, "resume": resume}
         )
@@ -268,7 +306,15 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
         LOG.info("No GPUs detected or device=cpu — running serial.")
         summary = skipped_summary.copy()
         for i, job in enumerate(jobs, start=1):
-            xyz, out_dir, overrides = job["xyz"], job["out_dir"], job["overrides"]
+            xyz = job["xyz"]
+            out_dir = job["out_dir"]
+            overrides = (job.get("overrides", {}) or {}).copy()
+
+            # same collision-avoidance as GPU path
+            resume_from_per_conf = overrides.pop(
+                "resume_from_per_conformer_csv", resume_from_per_common
+            )
+
             LOG.info("=== Job %d/%d: %s → %s ===", i, len(jobs), xyz, out_dir)
             try:
                 _ensure_dir(out_dir)
@@ -279,6 +325,7 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
                     device="cpu",
                     cache_dir=cache_dir,
                     use_local_scratch=use_local_scratch,
+                    resume_from_per_conformer_csv=resume_from_per_conf,
                     **overrides,
                 )
                 summary.append({"xyz": xyz, "out_dir": out_dir, "status": "ok"})
@@ -292,6 +339,7 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
     # Parallel: one worker per GPU
     LOG.info("Detected GPUs: %s", gpu_ids)
     mp.set_start_method("spawn", force=True)
+
     task_q: mp.Queue = mp.Queue()
     result_q: mp.Queue = mp.Queue()
 
@@ -301,18 +349,16 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
     for _ in gpu_ids:
         task_q.put(None)
 
-    # Start workers
-    procs: List[mp.Process] = []
     worker_common = {
         "model": model,
         "device": "cuda",
         "cache_dir": cache_dir,
         "use_local_scratch": use_local_scratch,
         "out_root": out_root,
-        "resume_from_per_conformer_csv": merged_common.get(
-            "resume_from_per_conformer_csv", False
-        ),
+        "resume_from_per_conformer_csv": resume_from_per_common,
     }
+
+    procs: List[mp.Process] = []
     for gid in gpu_ids:
         p = mp.Process(target=_worker_loop, args=(gid, task_q, result_q, worker_common))
         p.daemon = True
@@ -327,7 +373,6 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
         summary.append(res)
         remaining -= 1
 
-    # Join
     for p in procs:
         p.join()
 
