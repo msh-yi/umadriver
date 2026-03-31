@@ -476,7 +476,7 @@ class ORCAWriter:
             self._w("Vibrational entropy computed via Quasi-RRHO (Grimme).")
             self._w("Reference: Chem. Eur. J. 2012, 18, 9955.")
             self._w(f"QRRHORefFreq  ... {qrrho_ref_cm1:.1f} cm-1")
-            self._w(f"Mix exponent α ... {qrrho_alpha:.1f}")
+            self._w(f"Mix exponent alpha ... {qrrho_alpha:.1f}")
             self._w(
                 f"CutOffFreq    ... {cutoff_cm1:.1f} cm-1 (modes below excluded from thermo)"
             )

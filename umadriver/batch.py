@@ -1,4 +1,3 @@
-# umadriver/batch.py
 from __future__ import annotations
 
 import os
@@ -68,6 +67,49 @@ def _expand_xyz_inputs(xyz_list: Iterable[str]) -> List[str]:
         else:
             out.append(s)
     return out
+
+
+def _split_xyz_into_structures(xyz_path: str) -> List[tuple]:
+    """
+    Read an XYZ file and split into individual structures.
+    Returns list of (structure_content, structure_label) tuples.
+    Each structure_content is the full XYZ text for one geometry.
+    """
+    structures = []
+
+    with open(xyz_path, "r") as f:
+        lines = f.readlines()
+
+    i = 0
+    struct_idx = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        # First line of XYZ: atom count
+        try:
+            natoms = int(line.split()[0])
+        except (ValueError, IndexError):
+            i += 1
+            continue
+
+        # Capture: natoms line + comment line + natoms coordinate lines
+        if i + natoms + 1 < len(lines):
+            structure_block = lines[i : i + natoms + 2]
+            structures.append(("".join(structure_block), f"conf{struct_idx:04d}"))
+            struct_idx += 1
+            i += natoms + 2
+        else:
+            break
+
+    # Fallback: if parsing failed, treat whole file as single structure
+    if len(structures) == 0:
+        with open(xyz_path, "r") as f:
+            structures.append((f.read(), "conf0000"))
+
+    return structures
 
 
 def _parse_visible_devices_env() -> Optional[List[int]]:
@@ -150,6 +192,7 @@ def _worker_loop(
         out_dir = job["out_dir"]
         overrides = (job.get("overrides", {}) or {}).copy()
         resume = bool(job.get("resume", True))
+        cleanup_xyz = job.get("_cleanup_xyz")
 
         # Avoid keyword collisions: allow this to be set either in overrides or in common
         resume_from_per_conf = overrides.pop(
@@ -157,11 +200,19 @@ def _worker_loop(
             common.get("resume_from_per_conformer_csv", False),
         )
 
+        # Remove batch-level parameters that shouldn't be passed to run_conformer_workflow
+        overrides.pop("split_multi_structure", None)
+
         try:
             energies_csv = os.path.join(out_dir, "energies.csv")
             if resume and os.path.isfile(energies_csv):
                 LOG.info("[GPU %d] SKIP (resume): %s", gpu_id, out_dir)
                 result_q.put({"xyz": xyz, "out_dir": out_dir, "status": "skipped"})
+                if cleanup_xyz and os.path.exists(cleanup_xyz):
+                    try:
+                        os.remove(cleanup_xyz)
+                    except Exception:
+                        pass
                 continue
 
             _ensure_dir(out_dir)
@@ -179,9 +230,22 @@ def _worker_loop(
             )
             result_q.put({"xyz": xyz, "out_dir": out_dir, "status": "ok"})
 
+            # Cleanup temp file after successful run
+            if cleanup_xyz and os.path.exists(cleanup_xyz):
+                try:
+                    os.remove(cleanup_xyz)
+                except Exception:
+                    pass
+
         except Exception as e:
             LOG.exception("[GPU %d] Job failed: %s", gpu_id, e)
             result_q.put({"xyz": xyz, "out_dir": out_dir, "status": f"error: {e}"})
+            # Cleanup temp file even on error
+            if cleanup_xyz and os.path.exists(cleanup_xyz):
+                try:
+                    os.remove(cleanup_xyz)
+                except Exception:
+                    pass
 
 
 # =========================
@@ -244,21 +308,58 @@ def run_batch_from_glob(xyz_glob: List[str], common: BatchCommon, **overrides):
     cache_dir = merged.get("cache_dir")
     out_root = merged.get("out_root", "runs")
     resume = merged.get("resume", True)
+    split_multi = merged.get("split_multi_structure", True)
 
     _ensure_dir(out_root)
     LOG.info(
-        "Batch(glob): model=%s device=%s cache=%s out_root=%s resume=%s",
+        "Batch(glob): model=%s device=%s cache=%s out_root=%s resume=%s split_multi=%s",
         model,
         device,
         cache_dir or "<default>",
         out_root,
         resume,
+        split_multi,
     )
 
     jobs: List[Dict[str, Any]] = []
     for xyz in xyz_paths:
-        out_dir = _job_out_dir(out_root, xyz, None)
-        jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides.copy()})
+        base_name = os.path.splitext(os.path.basename(xyz))[0]
+
+        if split_multi:
+            structures = _split_xyz_into_structures(xyz)
+
+            if len(structures) == 1:
+                # Single structure - keep original behavior
+                out_dir = _job_out_dir(out_root, xyz, None)
+                jobs.append(
+                    {"xyz": xyz, "out_dir": out_dir, "overrides": overrides.copy()}
+                )
+                LOG.info(f"Added job: {xyz} (single structure)")
+            else:
+                # Multiple structures - create one job per structure
+                LOG.info(f"Splitting {xyz} into {len(structures)} structures")
+                for content, label in structures:
+                    # Create temporary single-structure XYZ file
+                    temp_dir = os.path.join(out_root, ".tmp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    temp_xyz = os.path.join(temp_dir, f"{base_name}_{label}.xyz")
+                    with open(temp_xyz, "w") as f:
+                        f.write(content)
+
+                    out_dir = os.path.join(out_root, f"{base_name}.ensemble", label)
+                    jobs.append(
+                        {
+                            "xyz": temp_xyz,
+                            "out_dir": out_dir,
+                            "overrides": overrides.copy(),
+                            "_cleanup_xyz": temp_xyz,
+                            "_original_xyz": xyz,
+                        }
+                    )
+        else:
+            # Original behavior: treat whole file as one job
+            out_dir = _job_out_dir(out_root, xyz, None)
+            jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides.copy()})
 
     return _run_parallel_jobs(jobs, merged)
 
@@ -285,16 +386,31 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
         xyz = j["xyz"]
         out_dir = j["out_dir"]
         overrides = (j.get("overrides", {}) or {}).copy()
+        cleanup_xyz = j.get("_cleanup_xyz")
 
         if resume and os.path.isfile(os.path.join(out_dir, "energies.csv")):
             LOG.info("Skipping (resume): %s", out_dir)
+            display_xyz = j.get("_original_xyz", xyz)
             skipped_summary.append(
-                {"xyz": xyz, "out_dir": out_dir, "status": "skipped"}
+                {"xyz": display_xyz, "out_dir": out_dir, "status": "skipped"}
             )
+            # Clean up temp file if it exists
+            if cleanup_xyz and os.path.exists(cleanup_xyz):
+                try:
+                    os.remove(cleanup_xyz)
+                except Exception:
+                    pass
             continue
 
         jobs.append(
-            {"xyz": xyz, "out_dir": out_dir, "overrides": overrides, "resume": resume}
+            {
+                "xyz": xyz,
+                "out_dir": out_dir,
+                "overrides": overrides,
+                "resume": resume,
+                "_cleanup_xyz": cleanup_xyz,
+                "_original_xyz": j.get("_original_xyz", xyz),
+            }
         )
 
     if not jobs:
@@ -309,11 +425,16 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
             xyz = job["xyz"]
             out_dir = job["out_dir"]
             overrides = (job.get("overrides", {}) or {}).copy()
+            cleanup_xyz = job.get("_cleanup_xyz")
+            display_xyz = job.get("_original_xyz", xyz)
 
             # same collision-avoidance as GPU path
             resume_from_per_conf = overrides.pop(
                 "resume_from_per_conformer_csv", resume_from_per_common
             )
+
+            # Remove batch-level parameters that shouldn't be passed to run_conformer_workflow
+            overrides.pop("split_multi_structure", None)
 
             LOG.info("=== Job %d/%d: %s → %s ===", i, len(jobs), xyz, out_dir)
             try:
@@ -328,12 +449,26 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
                     resume_from_per_conformer_csv=resume_from_per_conf,
                     **overrides,
                 )
-                summary.append({"xyz": xyz, "out_dir": out_dir, "status": "ok"})
+                summary.append({"xyz": display_xyz, "out_dir": out_dir, "status": "ok"})
+
+                # Cleanup temp file
+                if cleanup_xyz and os.path.exists(cleanup_xyz):
+                    try:
+                        os.remove(cleanup_xyz)
+                    except Exception:
+                        pass
+
             except Exception as e:
                 LOG.exception("Job failed: %s", e)
                 summary.append(
-                    {"xyz": xyz, "out_dir": out_dir, "status": f"error: {e}"}
+                    {"xyz": display_xyz, "out_dir": out_dir, "status": f"error: {e}"}
                 )
+                # Cleanup temp file even on error
+                if cleanup_xyz and os.path.exists(cleanup_xyz):
+                    try:
+                        os.remove(cleanup_xyz)
+                    except Exception:
+                        pass
         return summary
 
     # Parallel: one worker per GPU

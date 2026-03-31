@@ -1,4 +1,3 @@
-# uma/uma_driver.py
 import argparse
 import logging
 import os, sys
@@ -85,6 +84,17 @@ def main():
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu", "auto"])
     p.add_argument("--cache-dir", default=DEFAULT_FAIRCHEM_CACHE)
     p.add_argument("--use-local-scratch", action="store_true")
+
+    p.add_argument(
+        "--split-multi-structure",
+        dest="split_multi_structure",
+        action="store_true",
+        default=True,
+        help="Automatically split multi-structure XYZ files into separate jobs for parallel execution (default on).",
+    )
+    p.add_argument(
+        "--no-split-multi-structure", dest="split_multi_structure", action="store_false"
+    )
 
     # Per-job parameters (applied uniformly to every input unless you use manifest overrides)
     p.add_argument(
@@ -188,6 +198,7 @@ def main():
         irc_dx=args.irc_dx,
         conc_mol_L=args.conc_mol_l,
         resume_from_per_conformer_csv=True,
+        split_multi_structure=args.split_multi_structure,
     )
 
     if args.manifest:
