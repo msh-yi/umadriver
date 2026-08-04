@@ -453,7 +453,7 @@ class ORCAWriter:
             "-----------------------------------------------------------------------"
         )
         self._w(
-            f"Total correction                          {ZPE_Eh+Evib_corr_Eh+Etrans_Eh:12.8f} Eh"
+            f"Total correction                          {ZPE_Eh+Evib_corr_Eh+Erot_Eh+Etrans_Eh:12.8f} Eh"
         )
         self._w("")
         self._w("")

@@ -36,6 +36,56 @@ LOG = logging.getLogger("uma.ensemble")
 
 EH_TO_KCAL = EV_PER_HARTREE * KCAL_PER_MOL_PER_EV
 
+# Column layout of the ranked ensemble energies.csv. Shared with the batch-level
+# split-ensemble aggregator so both writers stay in lockstep.
+ENERGIES_FIELDS = [
+    "rank",
+    "index",
+    "tag",
+    "route",
+    "converged",
+    "steps",
+    "energy_Eh",
+    "energy_kcal",
+    "rel_kcal",
+    "gibbs_Eh",
+    "gibbs_kcal",
+    "n_imag",
+    "imag_ok",
+]
+
+
+def rank_by_energy(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Optional[float]]:
+    """Sort records by electronic energy (finite first) and assign ``rel_kcal``.
+
+    Records are mutated in place (``rel_kcal`` added) and returned in ranked order
+    alongside the reference energy ``e0`` (the lowest finite ``energy_Eh``), or
+    ``None`` if no finite energy exists. Used by both the per-job workflow and the
+    split-ensemble aggregator so ranking has a single source of truth.
+    """
+
+    def _sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
+        E = _safe_float(r.get("energy_Eh"))
+        return (0, E) if np.isfinite(E) else (1, 0.0)
+
+    rows_sorted = sorted(rows, key=_sort_key)
+
+    e0 = None
+    for r in rows_sorted:
+        E = _safe_float(r.get("energy_Eh"))
+        if np.isfinite(E):
+            e0 = E
+            break
+
+    for r in rows_sorted:
+        E = _safe_float(r.get("energy_Eh"))
+        r["rel_kcal"] = (
+            (E - e0) * EH_TO_KCAL if (e0 is not None and np.isfinite(E)) else float("nan")
+        )
+    return rows_sorted, e0
+
 
 # -----------------------
 # Utilities
@@ -181,7 +231,11 @@ def _minimize_atoms_inplace(
             grms, gmax = force_metrics_HB(forces)
             curr_pos = atoms.get_positions()
             drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
-            if gaussian_converged(grms, gmax, drms, dmax, cuts):
+            # Require a real displacement measurement before declaring convergence:
+            # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
+            if prev_pos is not None and gaussian_converged(
+                grms, gmax, drms, dmax, cuts
+            ):
                 converged = True
                 break
             prev_pos = curr_pos.copy()
@@ -222,7 +276,9 @@ def _minimize_atoms_inplace(
         grms, gmax = force_metrics_HB(forces)
         curr_pos = atoms.get_positions()
         drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
-        if gaussian_converged(grms, gmax, drms, dmax, cuts):
+        # Require a real displacement measurement before declaring convergence:
+        # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
+        if prev_pos is not None and gaussian_converged(grms, gmax, drms, dmax, cuts):
             converged = True
             break
         prev_pos = curr_pos.copy()
@@ -277,7 +333,11 @@ def _ts_optimize_atoms_inplace(
             grms, gmax = force_metrics_HB(forces)
             curr_pos = atoms.get_positions()
             drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
-            if gaussian_converged(grms, gmax, drms, dmax, cuts):
+            # Require a real displacement measurement before declaring convergence:
+            # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
+            if prev_pos is not None and gaussian_converged(
+                grms, gmax, drms, dmax, cuts
+            ):
                 converged = True
                 break
             prev_pos = curr_pos.copy()
@@ -638,27 +698,11 @@ def run_conformer_workflow(
     # -----------------------
     LOG.info("Ranking by electronic energy …")
 
-    def _sort_key(r: Dict[str, Any]) -> Tuple[int, float]:
-        E = _safe_float(r.get("energy_Eh"))
-        return (0, E) if np.isfinite(E) else (1, 0.0)
-
-    results_sorted = sorted(conformers, key=_sort_key)
-
-    # Reference energy e0 from first finite entry
-    e0 = None
-    for r in results_sorted:
-        E = _safe_float(r.get("energy_Eh"))
-        if np.isfinite(E):
-            e0 = E
-            break
+    results_sorted, e0 = rank_by_energy(conformers)
     if e0 is None:
         raise RuntimeError(
             "No finite electronic energies available to rank conformers."
         )
-
-    for r in results_sorted:
-        E = _safe_float(r.get("energy_Eh"))
-        r["rel_kcal"] = (E - e0) * EH_TO_KCAL if np.isfinite(E) else float("nan")
 
     ranked_xyz_path = os.path.join(out_dir, "optimized_ranked.xyz")
     ranked_atoms = [r["atoms"] for r in results_sorted if r.get("atoms") is not None]
@@ -857,21 +901,7 @@ def run_conformer_workflow(
     by_tag: Dict[str, Dict[str, Any]] = {c["tag"]: c for c in conformers}
 
     csv_path = os.path.join(out_dir, "energies.csv")
-    fieldnames = [
-        "rank",
-        "index",
-        "tag",
-        "route",
-        "converged",
-        "steps",
-        "energy_Eh",
-        "energy_kcal",
-        "rel_kcal",
-        "gibbs_Eh",
-        "gibbs_kcal",
-        "n_imag",
-        "imag_ok",
-    ]
+    fieldnames = ENERGIES_FIELDS
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()

@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Dict, Literal
-import logging, os, time, shutil, subprocess, math, getpass
+import argparse, logging, os, time, shutil, subprocess, math, getpass
 
 import numpy as np
 from ase import Atoms
@@ -184,7 +184,11 @@ def disp_metrics_bohr(prev_pos_A: Optional[np.ndarray], curr_pos_A: np.ndarray) 
     mags = np.linalg.norm(curr_pos_A - prev_pos_A, axis=1) * BOHR_PER_ANG
     return float(np.sqrt((mags**2).mean())), float(mags.max())
 
+@lru_cache(maxsize=None)
 def resolve_device(prefer: str = "cuda") -> str:
+    # Cached: device availability (and the nvidia-smi probe below) is constant for
+    # the life of the process, so we only shell out / log once per `prefer` value
+    # instead of on every calculator build.
     if prefer == "cuda":
         try:
             import torch

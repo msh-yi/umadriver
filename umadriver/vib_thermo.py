@@ -244,12 +244,14 @@ def run_frequencies_and_write(
     except Exception:
         pass
 
-    # Optional CUDA memory hygiene:
+    # Optional CUDA memory hygiene: drop the Vibrations object and free the GPU
+    # allocator cache between conformers to avoid OOM on long ensembles. We skip a
+    # forced gc.collect() here — it ran on every conformer and dominated allocator
+    # churn while refcounting already releases `vib` immediately.
     try:
-        import gc, torch
+        import torch
 
         del vib
-        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:

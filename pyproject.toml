@@ -12,6 +12,8 @@ dependencies = [
   "numpy>=1.23",
   "ase>=3.22.1",
   "fairchem-core>=2.4.0",
+  "sella",                    # default optimizer + all TS/IRC work
+  "pyyaml>=5.1",              # YAML manifests for batch mode
 ]
 
 [project.scripts]

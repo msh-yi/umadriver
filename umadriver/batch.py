@@ -19,7 +19,12 @@ try:
 except Exception:
     _HAVE_YAML = False
 
-from .ensemble import run_conformer_workflow, _ensure_dir
+from .ensemble import (
+    run_conformer_workflow,
+    _ensure_dir,
+    rank_by_energy,
+    ENERGIES_FIELDS,
+)
 
 
 # =========================
@@ -251,10 +256,15 @@ def _worker_loop(
 # =========================
 # Public API
 # =========================
+# Batch-level configuration keys that must never be forwarded to
+# run_conformer_workflow() as per-job workflow overrides.
+_BATCH_KEYS = set(BatchCommon.__dataclass_fields__.keys())
+
+
 def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overrides):
     cfg = _load_manifest(manifest_path)
     try:
-        common_cfg = cfg.get("common", {})
+        common_cfg = cfg.get("common", {}) or {}
     except AttributeError:
         print(
             "Manifest parse error. Expected top-level mapping with 'jobs:' and optional 'common:'."
@@ -265,7 +275,7 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
     if not isinstance(jobs_cfg, list):
         raise RuntimeError("Manifest 'jobs' must be a list.")
 
-    # Merge CLI overrides -> manifest common -> BatchCommon
+    # Merge CLI overrides -> manifest common -> BatchCommon (for scheduler-level config).
     merged = {**common.__dict__, **common_cfg, **cli_overrides}
 
     model = merged["model"]
@@ -274,6 +284,13 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
     use_local_scratch = merged.get("use_local_scratch", False)
     out_root = merged.get("out_root", "runs")
     resume = merged.get("resume", True)
+
+    # Workflow-level overrides that apply to every job, before per-job specialization.
+    # Batch-level keys (model/device/out_root/...) are stripped so they never reach
+    # run_conformer_workflow(). Precedence (low -> high):
+    #   CLI overrides < manifest common: < per-job flattened keys < per-job overrides:
+    cli_workflow = {k: v for k, v in cli_overrides.items() if k not in _BATCH_KEYS}
+    common_workflow = {k: v for k, v in common_cfg.items() if k not in _BATCH_KEYS}
 
     _ensure_dir(out_root)
     LOG.info(
@@ -290,7 +307,19 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
     for j in jobs_cfg:
         xyz = j["xyz"]
         out_dir = _job_out_dir(out_root, xyz, j.get("out_dir"))
-        overrides = (j.get("overrides", {}) or {}).copy()
+        # Flattened per-job keys: anything that isn't a structural key.
+        flattened = {
+            k: v
+            for k, v in j.items()
+            if k not in ("xyz", "out_dir", "overrides") and k not in _BATCH_KEYS
+        }
+        job_overrides = (j.get("overrides", {}) or {})
+        overrides = {
+            **cli_workflow,
+            **common_workflow,
+            **flattened,
+            **job_overrides,
+        }
         jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides})
 
     return _run_parallel_jobs(jobs, merged)
@@ -365,9 +394,106 @@ def run_batch_from_glob(xyz_glob: List[str], common: BatchCommon, **overrides):
 
 
 # =========================
+# Split-ensemble aggregation
+# =========================
+def _aggregate_split_ensembles(jobs_in: List[Dict[str, Any]]) -> None:
+    """Compile per-structure split jobs back into a single ranked ensemble.
+
+    When ``split_multi_structure`` explodes ``mol.xyz`` into per-structure jobs under
+    ``<root>/mol.ensemble/<label>/``, each writes its own single-row ``energies.csv``.
+    After the parallel/serial phase we read those back, rank across all structures,
+    and write ``<root>/mol.ensemble/energies.csv`` (+ ``optimized_ranked.xyz``).
+
+    Runs even when members were skipped via resume (their CSVs already exist), so the
+    aggregate is always regenerated. Non-split jobs (no ``_original_xyz``) are ignored
+    — they already own their ensemble CSV directly.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for j in jobs_in:
+        if not j.get("_original_xyz"):
+            continue
+        ens_dir = os.path.dirname(j["out_dir"])
+        groups.setdefault(ens_dir, []).append(j)
+
+    for ens_dir, members in groups.items():
+        rows: List[Dict[str, Any]] = []
+        xyz_by_label: Dict[str, str] = {}
+        for j in members:
+            member_dir = j["out_dir"]
+            label = os.path.basename(member_dir)  # e.g. "conf0007"
+            member_csv = os.path.join(member_dir, "energies.csv")
+            if not os.path.isfile(member_csv):
+                continue
+            try:
+                with open(member_csv, "r", newline="") as f:
+                    for row in csv.DictReader(f):
+                        # Each split job holds a single structure; relabel its row with
+                        # the split label so tags/indices stay unique across the ensemble.
+                        row["tag"] = label
+                        digits = "".join(ch for ch in label if ch.isdigit())
+                        if digits:
+                            row["index"] = int(digits)
+                        rows.append(row)
+            except Exception as e:
+                LOG.exception("Aggregation: failed reading %s: %s", member_csv, e)
+                continue
+            ranked_xyz = os.path.join(member_dir, "optimized_ranked.xyz")
+            if os.path.isfile(ranked_xyz):
+                xyz_by_label[label] = ranked_xyz
+
+        if not rows:
+            continue
+
+        ranked, _e0 = rank_by_energy(rows)
+
+        _ensure_dir(ens_dir)
+        out_csv = os.path.join(ens_dir, "energies.csv")
+        with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=ENERGIES_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            for rank, r in enumerate(ranked, start=1):
+                r["rank"] = rank
+                w.writerow({k: r.get(k) for k in ENERGIES_FIELDS})
+        LOG.info(
+            "Aggregated %d structures into ranked ensemble: %s", len(ranked), out_csv
+        )
+
+        # Concatenate per-structure optimized geometries in ranked order.
+        out_xyz = os.path.join(ens_dir, "optimized_ranked.xyz")
+        try:
+            chunks: List[str] = []
+            for r in ranked:
+                p = xyz_by_label.get(r.get("tag"))
+                if not p:
+                    continue
+                with open(p, "r") as xf:
+                    txt = xf.read()
+                if txt and not txt.endswith("\n"):
+                    txt += "\n"
+                chunks.append(txt)
+            if chunks:
+                with open(out_xyz, "w") as xf:
+                    xf.write("".join(chunks))
+        except Exception as e:
+            LOG.exception("Aggregation: failed writing %s: %s", out_xyz, e)
+
+
+# =========================
 # Scheduler
 # =========================
 def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, Any]):
+    """Run all jobs, then compile any split multi-structure jobs into ranked ensembles."""
+    summary = _run_parallel_jobs_impl(jobs_in, merged_common)
+    try:
+        _aggregate_split_ensembles(jobs_in)
+    except Exception as e:
+        LOG.exception("Split-ensemble aggregation failed: %s", e)
+    return summary
+
+
+def _run_parallel_jobs_impl(
+    jobs_in: List[Dict[str, Any]], merged_common: Dict[str, Any]
+):
     """
     Fan out jobs across GPUs (one worker per GPU). CPU fallback = serial loop.
     """
@@ -500,13 +626,42 @@ def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, A
         p.start()
         procs.append(p)
 
-    # Collect results
+    # Collect results. Track outstanding jobs by out_dir so that if a worker dies
+    # (segfault / OOM-kill) without posting a result we can detect it and bail out
+    # instead of blocking forever on result_q.get().
     summary: List[Dict[str, str]] = skipped_summary.copy()
-    remaining = len(jobs)
-    while remaining > 0:
-        res = result_q.get()
+    pending: Dict[str, Dict[str, Any]] = {j["out_dir"]: j for j in jobs}
+
+    def _record(res: Dict[str, str]):
         summary.append(res)
-        remaining -= 1
+        pending.pop(res.get("out_dir"), None)
+
+    while pending:
+        try:
+            _record(result_q.get(timeout=5.0))
+        except queue.Empty:
+            if any(p.is_alive() for p in procs):
+                continue  # workers still churning; keep waiting
+            # All workers have exited — drain any final results, then give up.
+            while True:
+                try:
+                    _record(result_q.get_nowait())
+                except queue.Empty:
+                    break
+            if pending:
+                LOG.error(
+                    "All workers exited with %d job(s) unfinished (likely crash/OOM).",
+                    len(pending),
+                )
+                for out_dir, j in pending.items():
+                    summary.append(
+                        {
+                            "xyz": j.get("_original_xyz", j.get("xyz")),
+                            "out_dir": out_dir,
+                            "status": "error: worker died before completion",
+                        }
+                    )
+            break
 
     for p in procs:
         p.join()

@@ -1,4 +1,4 @@
-# manifest.yaml — example jobs for `umadriver batch --manifest manifest.yaml`
+# manifest.yaml — example jobs for `umadriver --manifest manifest.yaml`
 # Schema: either use a per-job `overrides:` map or flattened keys for quick SP/solv/freq jobs.
 
 jobs:
@@ -7,7 +7,8 @@ jobs:
     out_dir: /n/home10/msak/comp/p_coop/uma_opt/ar3p/solv
     optimizer: null
     optts: false
-    do_freq: falseh
+    do_freq: false
+    solv: acetonitrile
     gauss_mem: 80GB
     gauss_nproc: "8"
 
