@@ -21,7 +21,7 @@ from .utils import (
     make_job_scratch,
     gaussian_cutoffs,
     gaussian_converged,
-    force_metrics_HB,
+    internal_force_metrics_HB,
     disp_metrics_bohr,
     resolve_device,
     build_calculator,
@@ -52,6 +52,7 @@ ENERGIES_FIELDS = [
     "gibbs_kcal",
     "n_imag",
     "imag_ok",
+    "solv_corr_kcal",
 ]
 
 
@@ -149,39 +150,33 @@ def _load_attempted_conformers(per_conf_csv: str) -> Dict[str, Dict[str, str]]:
     return rows_by_tag
 
 
-def _gaussian_write_gjf(
-    path: str,
-    atoms: Atoms,
-    charge: int,
-    mult: int,
-    route: str,
-    mem: str = "16GB",
-    nproc: str = "8",
-):
-    chk = os.path.splitext(os.path.basename(path))[0] + ".chk"
-    syms = atoms.get_chemical_symbols()
-    pos = atoms.get_positions()
-
-    lines: List[str] = [
-        f"%chk={chk}",
-        f"%mem={mem}",
-        f"%nprocshared={nproc}",
-        f"# {route}",
-        "",
-        os.path.basename(path),
-        "",
-        f"{charge} {mult}",
-    ]
-    for s, (x, y, z) in zip(syms, pos):
-        lines.append(f" {s:<2s}   {x: .8f}  {y: .8f}  {z: .8f}")
-    lines.append("")  # Gaussian likes a final blank line
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
-
-
 def _sp_energy_Eh(atoms: Atoms) -> float:
     e_eV = float(atoms.get_potential_energy())
     return e_eV * HARTREE_PER_EV
+
+
+def _log_unconverged(tag: str, cuts, grms, gmax, drms, dmax) -> None:
+    """Name the criteria that ran out of cycles, and by how much.
+
+    "conv=False" on its own says nothing about whether the run was one step away
+    or could never have converged at all — the difference between raising
+    --maxcycles and picking a different --opt-mode.
+    """
+    over = [
+        f"{name}={value:.2e} (cutoff {cut:.2e}, {value / cut:.1f}x)"
+        for name, value, cut in (
+            ("GRMS", grms, cuts.grms),
+            ("GMAX", gmax, cuts.gmax),
+            ("DRMS", drms, cuts.drms),
+            ("DMAX", dmax, cuts.dmax),
+        )
+        if value >= cut
+    ]
+    LOG.warning(
+        "  [%s] Not converged after maxcycles; still outside: %s",
+        tag,
+        ", ".join(over) if over else "nothing (converged on the final step only)",
+    )
 
 
 # -----------------------
@@ -228,8 +223,8 @@ def _minimize_atoms_inplace(
             steps = i
             opt.step()
             forces = atoms.get_forces()
-            grms, gmax = force_metrics_HB(forces)
             curr_pos = atoms.get_positions()
+            grms, gmax = internal_force_metrics_HB(curr_pos, forces)
             drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
             # Require a real displacement measurement before declaring convergence:
             # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
@@ -239,6 +234,9 @@ def _minimize_atoms_inplace(
                 converged = True
                 break
             prev_pos = curr_pos.copy()
+
+        if not converged and steps:
+            _log_unconverged("OPT", cuts, grms, gmax, drms, dmax)
 
         wall = time.perf_counter() - t_start
         E_h = _sp_energy_Eh(atoms)
@@ -273,8 +271,8 @@ def _minimize_atoms_inplace(
     for i, _ in enumerate(dyn.irun(fmax=ase_fmax, steps=maxcycles), start=1):
         steps = i
         forces = atoms.get_forces()
-        grms, gmax = force_metrics_HB(forces)
         curr_pos = atoms.get_positions()
+        grms, gmax = internal_force_metrics_HB(curr_pos, forces)
         drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
         # Require a real displacement measurement before declaring convergence:
         # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
@@ -282,6 +280,9 @@ def _minimize_atoms_inplace(
             converged = True
             break
         prev_pos = curr_pos.copy()
+
+    if not converged and steps:
+        _log_unconverged("OPT", cuts, grms, gmax, drms, dmax)
 
     wall = time.perf_counter() - t_start
     E_h = _sp_energy_Eh(atoms)
@@ -330,8 +331,8 @@ def _ts_optimize_atoms_inplace(
             steps = i
             opt.step()
             forces = atoms.get_forces()
-            grms, gmax = force_metrics_HB(forces)
             curr_pos = atoms.get_positions()
+            grms, gmax = internal_force_metrics_HB(curr_pos, forces)
             drms, dmax = disp_metrics_bohr(prev_pos, curr_pos)
             # Require a real displacement measurement before declaring convergence:
             # on step 1 prev_pos is None -> drms/dmax are trivially 0.0.
@@ -341,6 +342,9 @@ def _ts_optimize_atoms_inplace(
                 converged = True
                 break
             prev_pos = curr_pos.copy()
+
+        if not converged and steps:
+            _log_unconverged("TS ", cuts, grms, gmax, drms, dmax)
 
         wall = time.perf_counter() - t_start
         E_h = _sp_energy_Eh(atoms)
@@ -406,6 +410,10 @@ def run_conformer_workflow(
     freq_delta: float = 0.01,
     freq_nfree: int = 2,
     freq_scale: float = 1.0,
+    # >1 evaluates the finite-difference displacements in batches instead of one
+    # forward pass at a time. Default 1 keeps ASE's Vibrations path.
+    freq_batch_size: int = 1,
+    freq_xtb_workers: Optional[int] = None,
     temp: float = 298.15,
     pressure_atm: float = 1.0,
     symmetry_number: int = 1,
@@ -415,12 +423,16 @@ def run_conformer_workflow(
     cutoff_cm1: Optional[float] = None,
     qrrho_ref_cm1: float = 100.0,
     qrrho_alpha: float = 4.0,
-    # concentration-aware thermo
+    # concentration-aware thermo. `free_volume_solvent` only affects the
+    # translational-entropy standard state, and only when conc_mol_L is set — it is
+    # not a solvation energy. See _free_space_mL_per_L in vib_thermo.
     conc_mol_L: Optional[float] = None,
-    # solvation
-    solv: Optional[str] = None,
-    gauss_mem: str = "16GB",
-    gauss_nproc: str = "8",
+    free_volume_solvent: Optional[str] = None,
+    # ALPB solvation: E_tot = E_UMA + (E_xtb,alpb - E_xtb,vac), applied to every
+    # energy AND force, so geometries optimize in solvent.
+    alpb: Optional[str] = None,
+    alpb_method: str = "GFN2-xTB",
+    alpb_concurrent: bool = True,
     # Sella controls
     sella_internal: bool = True,
     sella_eta: float = 2e-2,
@@ -429,6 +441,11 @@ def run_conformer_workflow(
     # IRC
     irc: bool = False,
     irc_dx: float = 0.1,
+    # Sella's IRC inner loop wants its own eta/gamma, not the saddle-search values
+    # in SellaOpts; None means "use Sella's IRC defaults".
+    irc_eta: Optional[float] = None,
+    irc_gamma: Optional[float] = None,
+    irc_steps: int = 200,
     # Optional calculator injection
     calc: Optional[object] = None,
     # Resume PHASE 1 by skipping tags present in per-conformer CSV
@@ -509,6 +526,23 @@ def run_conformer_workflow(
     else:
         dev = device  # best-effort label
 
+    # ALPB solvation. Wrapping the calculator here is the whole feature: every
+    # downstream consumer — both optimizer loops, Sella, ase.vibrations, the IRC —
+    # reads energies and forces through atoms.get_potential_energy()/get_forces(),
+    # so optimization, TS search, frequencies, thermo and the IRC all become
+    # solvated with no further changes.
+    if alpb:
+        from .solvation import make_solvated_calculator
+
+        calc = make_solvated_calculator(
+            calc,
+            alpb,
+            method=alpb_method,
+            charge=charge,
+            mult=mult,
+            concurrent=alpb_concurrent,
+        )
+
     # Sella options object reused for all conformers
     sella = SellaOpts(
         internal=sella_internal,
@@ -527,6 +561,11 @@ def run_conformer_workflow(
         "steps",
         "energy_Eh",
         "energy_kcal",
+        # Which solvation the stored energy was computed under. Without this a
+        # resumed run cannot tell a solvated energy from a gas-phase one and would
+        # silently mix them.
+        "alpb",
+        "solv_corr_kcal",
     ]
     per_conf_write_header = (not os.path.exists(per_conf_csv)) or (
         os.path.getsize(per_conf_csv) == 0
@@ -538,7 +577,13 @@ def run_conformer_workflow(
         per_conf_f.flush()
 
     def _append_per_conf_row(
-        idx: int, tag: str, route: str, converged: bool, steps: int, E_h: float
+        idx: int,
+        tag: str,
+        route: str,
+        converged: bool,
+        steps: int,
+        E_h: float,
+        solv_corr_kcal: Optional[float] = None,
     ):
         try:
             per_conf_w.writerow(
@@ -550,6 +595,10 @@ def run_conformer_workflow(
                     steps=int(steps),
                     energy_Eh=float(E_h),
                     energy_kcal=_Eh_to_kcal(float(E_h)),
+                    alpb=(alpb or ""),
+                    solv_corr_kcal=(
+                        "" if solv_corr_kcal is None else f"{solv_corr_kcal:.6f}"
+                    ),
                 )
             )
             per_conf_f.flush()
@@ -567,6 +616,21 @@ def run_conformer_workflow(
     for idx, src in enumerate(frames):
         tag = f"conf_{idx:04d}"
         LOG.info("--- Conformer %d/%d | tag=%s ---", idx + 1, n, tag)
+
+        # A stored energy is only reusable if it was computed under the same
+        # solvation setting; otherwise a gas-phase and a solvated run would be
+        # silently mixed in one ensemble.
+        if resume_from_per_conformer_csv and (tag in attempted_rows):
+            prev_alpb = (attempted_rows[tag].get("alpb") or "").strip()
+            if prev_alpb != (alpb or ""):
+                LOG.warning(
+                    "  [RESUME] %s: stored energy used alpb=%r but this run uses "
+                    "%r — recomputing.",
+                    tag,
+                    prev_alpb or None,
+                    alpb,
+                )
+                attempted_rows.pop(tag)
 
         # Resume skip logic (skip PHASE 1 if tag already present)
         if resume_from_per_conformer_csv and (tag in attempted_rows):
@@ -682,8 +746,22 @@ def run_conformer_workflow(
                 "  [DUMP] Failed to write per-conformer XYZ for %s: %s", tag, e
             )
 
+        # The solvation term is already cached on the calculator from the last
+        # evaluation — reading it costs no extra SCF.
+        solv_corr_kcal = None
+        if alpb:
+            from .solvation import solvation_correction_eV
+
+            d_eV = solvation_correction_eV(a.calc)
+            if d_eV is not None:
+                solv_corr_kcal = d_eV * KCAL_PER_MOL_PER_EV
+                rec["solv_corr_kcal"] = solv_corr_kcal
+                LOG.info("  Solvation correction: %+.3f kcal/mol", solv_corr_kcal)
+
         # Append per-conformer CSV row
-        _append_per_conf_row(idx, tag, route_kind, converged, steps, E_h)
+        _append_per_conf_row(
+            idx, tag, route_kind, converged, steps, E_h, solv_corr_kcal
+        )
 
     # Close per-conf CSV handle
     try:
@@ -711,41 +789,6 @@ def run_conformer_workflow(
         LOG.info("Wrote ranked XYZ: %s", ranked_xyz_path)
     else:
         LOG.warning("No structures available to write ranked XYZ: %s", ranked_xyz_path)
-
-    # -----------------------
-    # PHASE 2: Gaussian inputs (ORIGINAL ORDER)
-    # -----------------------
-    if solv:
-        gjf_dir = os.path.join(out_dir, "gaussian")
-        _ensure_dir(gjf_dir)
-        LOG.info("PHASE 2: Writing Gaussian inputs (original order) …")
-        for r in conformers:
-            a, tag = r.get("atoms"), r.get("tag")
-            if a is None:
-                LOG.warning("  [GJF] %s skipped (no structure)", tag)
-                continue
-            route_gas = "M052X/6-31G*"
-            route_smd = f"M052X/6-31G* scrf(SMD,solvent={solv})"
-            _gaussian_write_gjf(
-                os.path.join(gjf_dir, f"{tag}_gas.gjf"),
-                a,
-                charge,
-                mult,
-                route_gas,
-                gauss_mem,
-                gauss_nproc,
-            )
-            _gaussian_write_gjf(
-                os.path.join(gjf_dir, f"{tag}_smd.gjf"),
-                a,
-                charge,
-                mult,
-                route_smd,
-                gauss_mem,
-                gauss_nproc,
-            )
-            LOG.info("  [GJF] %s done", tag)
-        LOG.info("PHASE 2: Completed.")
 
     # -----------------------
     # PHASE 3: Frequencies + thermo (serial; ORIGINAL ORDER)
@@ -779,6 +822,8 @@ def run_conformer_workflow(
                     scale=freq_scale,
                     scratch_dir=os.path.join(job_scratch, tag),
                     ts=ts_flag,
+                    batch_size=freq_batch_size,
+                    xtb_workers=freq_xtb_workers,
                 )
 
                 n_imag = sum(1 for f in freqs if f < 0.0)
@@ -796,7 +841,7 @@ def run_conformer_workflow(
                     qrrho_ref_cm1=qrrho_ref_cm1,
                     qrrho_alpha=qrrho_alpha,
                     conc_mol_L=conc_mol_L,
-                    solv=solv,
+                    solv=free_volume_solvent,
                     multiplicity=mult,
                 )
                 G_Eh = float(th["G_total_Eh"])
@@ -861,24 +906,29 @@ def run_conformer_workflow(
                 continue
 
             tag = r["tag"]
-            route_used = r.get("route", route_kind)
 
-            # Keep your previous semantics:
-            # - If TS optimization requested: require imag_ok (if freq ran), otherwise run.
-            # - Otherwise: run IRC unconditionally (user asked for it).
-            run_this = True
-            if optts:
-                if do_freq:
-                    run_this = r.get("imag_ok") is True
-                else:
-                    run_this = True
-
-            if not run_this:
-                LOG.info("  [IRC] %s: skip (not TS with 1 imaginary)", tag)
+            # An IRC only means anything from a first-order saddle. When frequencies
+            # were computed we know whether this is one, so trust that regardless of
+            # how the geometry was produced — previously a non-TS route skipped the
+            # check entirely and happily traced an IRC out of a minimum.
+            n_imag = r.get("n_imag")
+            if do_freq and n_imag is not None and int(n_imag) != 1:
+                LOG.info(
+                    "  [IRC] %s: skip (n_imag=%s, need exactly 1 imaginary mode)",
+                    tag,
+                    n_imag,
+                )
+                r["irc_ok"] = False
                 continue
+            if not do_freq:
+                LOG.warning(
+                    "  [IRC] %s: no frequencies were run — cannot confirm this is a "
+                    "saddle point. Proceeding as requested.",
+                    tag,
+                )
 
             try:
-                run_irc_trajectories(
+                r["irc"] = run_irc_trajectories(
                     a,
                     tag=tag,
                     out_dir=irc_dir,
@@ -890,9 +940,14 @@ def run_conformer_workflow(
                         gamma=sella_gamma,
                         delta0=sella_delta0,
                     ),
+                    eta=irc_eta,
+                    gamma=irc_gamma,
+                    steps=irc_steps,
                 )
+                r["irc_ok"] = True
                 LOG.info("  [IRC] %s done.", tag)
             except Exception as e:
+                r["irc_ok"] = False
                 LOG.exception("  [IRC] %s failed: %s", tag, e)
 
     # -----------------------
@@ -923,6 +978,7 @@ def run_conformer_workflow(
                     gibbs_kcal=match.get("gibbs_kcal"),
                     n_imag=match.get("n_imag"),
                     imag_ok=match.get("imag_ok"),
+                    solv_corr_kcal=match.get("solv_corr_kcal"),
                 )
             )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import csv
 import glob
 import logging
 import json
@@ -40,6 +41,12 @@ class BatchCommon:
     use_local_scratch: bool = False
     out_root: str = "runs"
     resume: bool = True  # skip job if energies.csv exists
+    # Explode multi-structure XYZs into one job per structure so conformers from
+    # every input pool into the shared queue and spread across GPUs.
+    split_multi_structure: bool = True
+    # Worker processes per GPU. >1 hides single-structure inference latency on
+    # large cards; costs VRAM linearly.
+    workers_per_gpu: int = 1
 
 
 # =========================
@@ -117,21 +124,109 @@ def _split_xyz_into_structures(xyz_path: str) -> List[tuple]:
     return structures
 
 
-def _parse_visible_devices_env() -> Optional[List[int]]:
+def _already_done_unsplit(out_dir: str) -> bool:
+    """True if out_dir holds a finished run from before splitting was applied here.
+
+    Splitting moves each structure into ``<out_dir>/<label>/``, so a job that
+    previously completed whole-file has no member directories and would be redone
+    from scratch — the members' resume checks look at paths that never existed.
+    An ensemble CSV with no member dirs next to it is exactly that case.
+    """
+    if not os.path.isfile(os.path.join(out_dir, "energies.csv")):
+        return False
+    return not os.path.isdir(os.path.join(out_dir, "conf0000"))
+
+
+def _expand_jobs_with_splitting(
+    jobs: List[Dict[str, Any]], split_multi: bool, resume: bool = False
+) -> List[Dict[str, Any]]:
+    """Explode each multi-structure job into one member job per structure.
+
+    The scheduler's unit of work is a whole job, and ``run_conformer_workflow``
+    walks a job's conformers serially. So an unsplit N-conformer file occupies a
+    single GPU for the whole run while the others idle. Splitting puts every
+    structure on the shared queue instead, where free workers pick them up.
+
+    Members land in ``<job out_dir>/<label>/``, which is what lets
+    ``_aggregate_split_ensembles`` recompile them (it groups by the parent of
+    ``out_dir``). Temp single-structure XYZs go under the job's own out_dir rather
+    than a batch-global ``.tmp``, so manifests with absolute ``out_dir:`` stay
+    self-contained instead of scattering files relative to cwd.
+
+    Used by both the manifest and glob paths — previously only the glob path split,
+    which is why manifest runs never fanned out.
+    """
+    if not split_multi:
+        return jobs
+
+    expanded: List[Dict[str, Any]] = []
+    for job in jobs:
+        xyz = job["xyz"]
+        out_dir = job["out_dir"]
+
+        try:
+            structures = _split_xyz_into_structures(xyz)
+        except Exception as e:
+            LOG.exception("Could not split %s (%s); running as a single job.", xyz, e)
+            expanded.append(job)
+            continue
+
+        if len(structures) <= 1:
+            LOG.info("Job %s: single structure", xyz)
+            expanded.append(job)
+            continue
+
+        if resume and _already_done_unsplit(out_dir):
+            LOG.info(
+                "Job %s: %s already holds a completed whole-file run; keeping it "
+                "unsplit so --resume can skip it (use --no-resume to redo it split).",
+                xyz,
+                out_dir,
+            )
+            expanded.append(job)
+            continue
+
+        LOG.info("Splitting %s into %d structures", xyz, len(structures))
+        split_dir = os.path.join(out_dir, ".split")
+        _ensure_dir(split_dir)
+        base = os.path.splitext(os.path.basename(xyz))[0]
+
+        for content, label in structures:
+            temp_xyz = os.path.join(split_dir, f"{base}_{label}.xyz")
+            with open(temp_xyz, "w") as f:
+                f.write(content)
+
+            member = dict(job)
+            member["xyz"] = temp_xyz
+            member["out_dir"] = os.path.join(out_dir, label)
+            member["overrides"] = (job.get("overrides") or {}).copy()
+            member["_cleanup_xyz"] = temp_xyz
+            member["_original_xyz"] = xyz
+            expanded.append(member)
+
+    return expanded
+
+
+def _parse_visible_devices_env() -> Optional[List[str]]:
+    """Device tokens from CUDA_VISIBLE_DEVICES, kept verbatim.
+
+    Deliberately NOT parsed as integers. On a MIG-partitioned card the tokens are
+    UUIDs (``MIG-69ef5d14-...``), and those are the only way to address a specific
+    slice — an integer index silently resolves to the *first* slice no matter what
+    number you use, so int-coercing here would collapse every worker onto one
+    slice while reporting that several were in use.
+    """
     s = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if not s:
         return None
-    try:
-        devs = [int(x) for x in s.split(",") if x.strip() != ""]
-        return devs if devs else None
-    except Exception:
-        return None
+    toks = [t.strip() for t in s.split(",") if t.strip()]
+    return toks or None
 
 
-def _discover_gpus(device: str) -> List[int]:
+def _discover_gpus(device: str) -> List[str]:
     """
-    Returns a list of GPU ids visible to this process.
-    If device is cpu -> [].
+    Returns the device tokens visible to this process (integer indices as strings,
+    or MIG UUIDs). If device is cpu -> [].
     """
     if device.lower() == "cpu":
         return []
@@ -144,29 +239,64 @@ def _discover_gpus(device: str) -> List[int]:
         import torch
 
         n = torch.cuda.device_count()
-        return list(range(n)) if n > 0 else []
+        return [str(i) for i in range(n)]
     except Exception:
         return []
 
 
-def _bind_gpu_env(gpu_id: int, out_root: str):
+def _worker_slots(gpu_ids: List[str], workers_per_gpu: int) -> List[str]:
+    """One entry per worker process, holding the device token it binds to.
+
+    Interleaved rather than grouped (``[0,1,0,1]`` not ``[0,0,1,1]``) so that a run
+    with fewer jobs than slots still spreads across distinct GPUs.
     """
-    Bind this child process to exactly one GPU.
-    Also shard scratch if UMA_SCRATCH_ROOT is not already set.
+    n = max(1, int(workers_per_gpu or 1))
+    return [g for _ in range(n) for g in gpu_ids]
+
+
+_THREAD_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+
+
+def _bind_gpu_env(gpu_id: str, out_root: str, n_workers: int = 1):
+    """
+    Bind this child process to exactly one GPU and give it its share of the CPUs.
+
+    ``gpu_id`` is a device token — an integer index or a MIG UUID — and is written
+    back verbatim, which is what actually pins a worker to a specific MIG slice.
+
+    ``n_workers`` is the total number of worker processes in this run, not the
+    number per GPU.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+    # The parent sets OMP_NUM_THREADS & friends to the *full* CPU allocation
+    # (driver._early_parse_threads), and every spawned worker inherits that value —
+    # so N workers each try to use all the cores. Overwrite with this worker's share.
+    # Must be assignment, not setdefault: the vars are already set by inheritance.
+    if n_workers > 1:
+        total = int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) or (os.cpu_count() or 1)
+        share = str(max(1, total // n_workers))
+        for var in _THREAD_VARS:
+            os.environ[var] = share
+
     # If user did not specify UMA_SCRATCH_ROOT, shard by GPU to reduce contention.
     if "UMA_SCRATCH_ROOT" not in os.environ:
-        os.environ["UMA_SCRATCH_ROOT"] = os.path.join(out_root, f"_gpu{gpu_id}_scratch")
+        # MIG tokens are long UUIDs; keep the directory name short but distinct.
+        short = str(gpu_id).replace("MIG-", "")[:8]
+        os.environ["UMA_SCRATCH_ROOT"] = os.path.join(out_root, f"_gpu{short}_scratch")
 
 
 # =========================
 # Worker
 # =========================
 def _worker_loop(
-    gpu_id: int,
+    gpu_id: str,
     task_q: mp.Queue,
     result_q: mp.Queue,
     common: Dict[str, Any],
@@ -180,8 +310,8 @@ def _worker_loop(
     from .utils import setup_logging
 
     setup_logging(verbose=True, debug=False)
-    _bind_gpu_env(gpu_id, common["out_root"])
-    LOG.info("[GPU %d] worker start", gpu_id)
+    _bind_gpu_env(gpu_id, common["out_root"], common.get("n_workers", 1))
+    LOG.info("[GPU %s] worker start", gpu_id)
 
     while True:
         try:
@@ -190,7 +320,7 @@ def _worker_loop(
             continue
 
         if job is None:
-            LOG.info("[GPU %d] worker exit", gpu_id)
+            LOG.info("[GPU %s] worker exit", gpu_id)
             break
 
         xyz = job["xyz"]
@@ -205,13 +335,13 @@ def _worker_loop(
             common.get("resume_from_per_conformer_csv", False),
         )
 
-        # Remove batch-level parameters that shouldn't be passed to run_conformer_workflow
-        overrides.pop("split_multi_structure", None)
+        # Batch-level keys are stripped at job-construction time (see _BATCH_KEYS),
+        # so `overrides` here is workflow kwargs only.
 
         try:
             energies_csv = os.path.join(out_dir, "energies.csv")
             if resume and os.path.isfile(energies_csv):
-                LOG.info("[GPU %d] SKIP (resume): %s", gpu_id, out_dir)
+                LOG.info("[GPU %s] SKIP (resume): %s", gpu_id, out_dir)
                 result_q.put({"xyz": xyz, "out_dir": out_dir, "status": "skipped"})
                 if cleanup_xyz and os.path.exists(cleanup_xyz):
                     try:
@@ -221,7 +351,7 @@ def _worker_loop(
                 continue
 
             _ensure_dir(out_dir)
-            LOG.info("[GPU %d] RUN: %s → %s", gpu_id, xyz, out_dir)
+            LOG.info("[GPU %s] RUN: %s → %s", gpu_id, xyz, out_dir)
 
             run_conformer_workflow(
                 xyz,
@@ -243,7 +373,7 @@ def _worker_loop(
                     pass
 
         except Exception as e:
-            LOG.exception("[GPU %d] Job failed: %s", gpu_id, e)
+            LOG.exception("[GPU %s] Job failed: %s", gpu_id, e)
             result_q.put({"xyz": xyz, "out_dir": out_dir, "status": f"error: {e}"})
             # Cleanup temp file even on error
             if cleanup_xyz and os.path.exists(cleanup_xyz):
@@ -284,6 +414,7 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
     use_local_scratch = merged.get("use_local_scratch", False)
     out_root = merged.get("out_root", "runs")
     resume = merged.get("resume", True)
+    split_multi = merged.get("split_multi_structure", True)
 
     # Workflow-level overrides that apply to every job, before per-job specialization.
     # Batch-level keys (model/device/out_root/...) are stripped so they never reach
@@ -294,12 +425,13 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
 
     _ensure_dir(out_root)
     LOG.info(
-        "Batch(manifest): model=%s device=%s cache=%s out_root=%s resume=%s",
+        "Batch(manifest): model=%s device=%s cache=%s out_root=%s resume=%s split_multi=%s",
         model,
         device,
         cache_dir or "<default>",
         out_root,
         resume,
+        split_multi,
     )
 
     # Prepare job list (resolve out_dir now)
@@ -313,7 +445,14 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
             for k, v in j.items()
             if k not in ("xyz", "out_dir", "overrides") and k not in _BATCH_KEYS
         }
-        job_overrides = (j.get("overrides", {}) or {})
+        # Per-job `overrides:` is filtered too — otherwise a batch-level key written
+        # there (e.g. split_multi_structure) reaches run_conformer_workflow as an
+        # unexpected kwarg and kills the job.
+        job_overrides = {
+            k: v
+            for k, v in (j.get("overrides", {}) or {}).items()
+            if k not in _BATCH_KEYS
+        }
         overrides = {
             **cli_workflow,
             **common_workflow,
@@ -322,6 +461,7 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
         }
         jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides})
 
+    jobs = _expand_jobs_with_splitting(jobs, split_multi, resume=resume)
     return _run_parallel_jobs(jobs, merged)
 
 
@@ -339,6 +479,9 @@ def run_batch_from_glob(xyz_glob: List[str], common: BatchCommon, **overrides):
     resume = merged.get("resume", True)
     split_multi = merged.get("split_multi_structure", True)
 
+    # Batch-level config must not ride along as run_conformer_workflow kwargs.
+    overrides = {k: v for k, v in overrides.items() if k not in _BATCH_KEYS}
+
     _ensure_dir(out_root)
     LOG.info(
         "Batch(glob): model=%s device=%s cache=%s out_root=%s resume=%s split_multi=%s",
@@ -350,46 +493,16 @@ def run_batch_from_glob(xyz_glob: List[str], common: BatchCommon, **overrides):
         split_multi,
     )
 
-    jobs: List[Dict[str, Any]] = []
-    for xyz in xyz_paths:
-        base_name = os.path.splitext(os.path.basename(xyz))[0]
+    jobs: List[Dict[str, Any]] = [
+        {
+            "xyz": xyz,
+            "out_dir": _job_out_dir(out_root, xyz, None),
+            "overrides": overrides.copy(),
+        }
+        for xyz in xyz_paths
+    ]
 
-        if split_multi:
-            structures = _split_xyz_into_structures(xyz)
-
-            if len(structures) == 1:
-                # Single structure - keep original behavior
-                out_dir = _job_out_dir(out_root, xyz, None)
-                jobs.append(
-                    {"xyz": xyz, "out_dir": out_dir, "overrides": overrides.copy()}
-                )
-                LOG.info(f"Added job: {xyz} (single structure)")
-            else:
-                # Multiple structures - create one job per structure
-                LOG.info(f"Splitting {xyz} into {len(structures)} structures")
-                for content, label in structures:
-                    # Create temporary single-structure XYZ file
-                    temp_dir = os.path.join(out_root, ".tmp")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    temp_xyz = os.path.join(temp_dir, f"{base_name}_{label}.xyz")
-                    with open(temp_xyz, "w") as f:
-                        f.write(content)
-
-                    out_dir = os.path.join(out_root, f"{base_name}.ensemble", label)
-                    jobs.append(
-                        {
-                            "xyz": temp_xyz,
-                            "out_dir": out_dir,
-                            "overrides": overrides.copy(),
-                            "_cleanup_xyz": temp_xyz,
-                            "_original_xyz": xyz,
-                        }
-                    )
-        else:
-            # Original behavior: treat whole file as one job
-            out_dir = _job_out_dir(out_root, xyz, None)
-            jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides.copy()})
-
+    jobs = _expand_jobs_with_splitting(jobs, split_multi, resume=resume)
     return _run_parallel_jobs(jobs, merged)
 
 
@@ -495,7 +608,8 @@ def _run_parallel_jobs_impl(
     jobs_in: List[Dict[str, Any]], merged_common: Dict[str, Any]
 ):
     """
-    Fan out jobs across GPUs (one worker per GPU). CPU fallback = serial loop.
+    Fan out jobs across GPUs (``workers_per_gpu`` workers each, default 1).
+    CPU fallback = serial loop.
     """
     out_root = merged_common.get("out_root", "runs")
     resume = merged_common.get("resume", True)
@@ -503,6 +617,7 @@ def _run_parallel_jobs_impl(
     cache_dir = merged_common.get("cache_dir")
     model = merged_common.get("model", "uma-m-1p1")
     use_local_scratch = merged_common.get("use_local_scratch", False)
+    workers_per_gpu = max(1, int(merged_common.get("workers_per_gpu", 1) or 1))
     resume_from_per_common = merged_common.get("resume_from_per_conformer_csv", False)
 
     # Materialize job list with resume flag; skip already-done jobs
@@ -559,9 +674,6 @@ def _run_parallel_jobs_impl(
                 "resume_from_per_conformer_csv", resume_from_per_common
             )
 
-            # Remove batch-level parameters that shouldn't be passed to run_conformer_workflow
-            overrides.pop("split_multi_structure", None)
-
             LOG.info("=== Job %d/%d: %s → %s ===", i, len(jobs), xyz, out_dir)
             try:
                 _ensure_dir(out_dir)
@@ -597,8 +709,15 @@ def _run_parallel_jobs_impl(
                         pass
         return summary
 
-    # Parallel: one worker per GPU
-    LOG.info("Detected GPUs: %s", gpu_ids)
+    # Parallel: `workers_per_gpu` workers per GPU, all pulling from one shared queue
+    # (dynamic work-stealing, so uneven job costs self-balance).
+    slots = _worker_slots(gpu_ids, workers_per_gpu)
+    LOG.info(
+        "Detected GPUs: %s | workers_per_gpu=%d | %d worker(s)",
+        gpu_ids,
+        workers_per_gpu,
+        len(slots),
+    )
     mp.set_start_method("spawn", force=True)
 
     task_q: mp.Queue = mp.Queue()
@@ -607,7 +726,7 @@ def _run_parallel_jobs_impl(
     # Enqueue all jobs, then one sentinel per worker
     for j in jobs:
         task_q.put(j)
-    for _ in gpu_ids:
+    for _ in slots:
         task_q.put(None)
 
     worker_common = {
@@ -617,10 +736,11 @@ def _run_parallel_jobs_impl(
         "use_local_scratch": use_local_scratch,
         "out_root": out_root,
         "resume_from_per_conformer_csv": resume_from_per_common,
+        "n_workers": len(slots),
     }
 
     procs: List[mp.Process] = []
-    for gid in gpu_ids:
+    for gid in slots:
         p = mp.Process(target=_worker_loop, args=(gid, task_q, result_q, worker_common))
         p.daemon = True
         p.start()

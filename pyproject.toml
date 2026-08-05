@@ -16,9 +16,20 @@ dependencies = [
   "pyyaml>=5.1",              # YAML manifests for batch mode
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+# ALPB implicit solvation (--alpb). Optional: only needed for solvated runs.
+solvation = ["tblite"]
+
 [project.scripts]
 umadriver = "umadriver.driver:main"            # CLI: `umadriver`
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["umadriver*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "big: slow runs on the 170-atom catalyst (opt in with --runbig)",
+]

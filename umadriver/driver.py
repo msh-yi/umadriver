@@ -27,20 +27,41 @@ def _early_parse_threads(argv):
     if ns.jax_platform == "cpu" and add not in flags:
         os.environ["XLA_FLAGS"] = (flags + " " + add).strip()
 
+    # Assign, do not setdefault. SLURM (and many site profiles) export
+    # OMP_NUM_THREADS=1 into the job environment, and setdefault is a no-op when
+    # the variable already exists — so this block silently did nothing and
+    # --sella-threads had no effect at all. Sella's BLAS work, and anything else
+    # OpenMP-parallel, ran single-threaded regardless of what was requested.
     for var in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
         "OPENBLAS_NUM_THREADS",
         "NUMEXPR_NUM_THREADS",
     ):
-        os.environ.setdefault(var, str(n))
+        os.environ[var] = str(n)
 
 
-_early_parse_threads(sys.argv[1:])
+def _strip_batch_token(argv):
+    """Accept an optional leading ``batch`` verb: `umadriver batch --manifest x.yaml`.
 
-from .utils import setup_logging, mode_type, optimizer_type
+    Historically this "worked" only by accident — there are no subcommands, so
+    `batch` was swallowed as a positional input and then ignored because
+    --manifest short-circuits the positional list. That silently broke
+    `umadriver batch mol.xyz`, which tried to open a file named "batch". Strip it
+    explicitly instead; the bare `umadriver mol.xyz ...` form is unaffected.
+    """
+    if argv and argv[0] == "batch":
+        return argv[1:]
+    return argv
+
+
+_early_parse_threads(_strip_batch_token(sys.argv[1:]))
+
+from .utils import setup_logging, mode_type, optimizer_type, initialize_env
 from .constants import DEFAULT_FAIRCHEM_CACHE, VAST_BASE
 from .batch import BatchCommon, run_batch_from_manifest, run_batch_from_glob
+from .vib_thermo import FREE_VOLUME_SOLVENTS
+from .solvation import ALPB_METHODS
 
 LOG = logging.getLogger("umadriver")
 
@@ -95,6 +116,13 @@ def main():
     p.add_argument(
         "--no-split-multi-structure", dest="split_multi_structure", action="store_false"
     )
+    p.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=1,
+        help="Worker processes per GPU (default 1). >1 hides single-structure "
+        "inference latency on large cards; costs VRAM linearly.",
+    )
 
     # Per-job parameters (applied uniformly to every input unless you use manifest overrides)
     p.add_argument(
@@ -125,6 +153,23 @@ def main():
     p.add_argument("--freq-delta", type=float, default=0.01)
     p.add_argument("--freq-nfree", type=int, default=2)
     p.add_argument("--freq-scale", type=float, default=1.0)
+    p.add_argument(
+        "--freq-batch-size",
+        type=int,
+        default=1,
+        help="Evaluate finite-difference displacements in batches of this size "
+        "(default 1 = ASE's one-at-a-time Vibrations path). Large speedup for "
+        "frequencies; costs VRAM, and multiplies with --workers-per-gpu.",
+    )
+
+    p.add_argument(
+        "--freq-xtb-workers",
+        type=int,
+        default=None,
+        help="Concurrent xtb calls during a solvated frequency run (default: "
+        "cores // OMP_NUM_THREADS). xtb parallelizes poorly within a call, so "
+        "throughput comes from running many single-threaded calls at once.",
+    )
 
     p.add_argument("--temp", type=float, default=298.15)
     p.add_argument("--pressure-atm", type=float, default=1.00)
@@ -140,19 +185,63 @@ def main():
 
     p.add_argument("--conc-mol-l", type=float, default=None)
 
-    p.add_argument("--solv", default=None)
-    p.add_argument("--gauss-mem", default="160GB")
-    p.add_argument("--gauss-nproc", default="16")
+    p.add_argument(
+        "--alpb",
+        default=None,
+        metavar="SOLVENT",
+        help="Add an ALPB solvation correction from xtb: "
+        "E = E_UMA + (E_xtb,alpb - E_xtb,vacuum). Applies to every energy AND "
+        "force, so geometries optimize in solvent. Requires `tblite`.",
+    )
+    p.add_argument(
+        "--alpb-method",
+        default="GFN2-xTB",
+        choices=list(ALPB_METHODS),
+        help="xTB Hamiltonian used for the solvation correction (default GFN2-xTB). "
+        "ALPB is not parameterized for GFN0.",
+    )
+    p.add_argument(
+        "--no-alpb-concurrent",
+        dest="alpb_concurrent",
+        action="store_false",
+        help="Evaluate UMA and the two xtb calls one after another instead of "
+        "concurrently. Concurrency measured 2.5x faster on a 170-atom system.",
+    )
+    p.set_defaults(alpb_concurrent=True)
+
+    p.add_argument(
+        "--free-volume-solvent",
+        default=None,
+        choices=FREE_VOLUME_SOLVENTS,
+        help="Solvent used for the free-volume translational-entropy correction. "
+        "Only has an effect together with --conc-mol-l, and is unrelated to --alpb.",
+    )
 
     p.add_argument("--irc", action="store_true")
     p.add_argument("--irc-dx", type=float, default=0.1)
+    p.add_argument(
+        "--irc-eta",
+        type=float,
+        default=None,
+        help="Sella IRC eta (default: --sella-eta).",
+    )
+    p.add_argument(
+        "--irc-gamma",
+        type=float,
+        default=None,
+        help="Sella IRC gamma (default: --sella-gamma). Do not loosen this: Sella's own IRC default of 0.1 fails to resolve the negative mode and the IRC exits without stepping.",
+    )
+    p.add_argument("--irc-steps", type=int, default=200)
 
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--debug", action="store_true")
 
-    args = p.parse_args()
+    args = p.parse_args(_strip_batch_token(sys.argv[1:]))
 
     setup_logging(verbose=args.verbose, debug=args.debug)
+    # Sets HF_HUB_OFFLINE=1 when the model cache is already populated, so a healthy
+    # run doesn't depend on the Hub being reachable (or the token being current).
+    initialize_env()
     LOG.info("CLI args: %s", vars(args))
 
     # ensure scratch root visible to workers
@@ -165,6 +254,8 @@ def main():
         use_local_scratch=args.use_local_scratch,
         out_root=args.out_root,
         resume=args.resume,
+        split_multi_structure=args.split_multi_structure,
+        workers_per_gpu=args.workers_per_gpu,
     )
 
     # Overrides are parameters of run_conformer_workflow()
@@ -179,6 +270,8 @@ def main():
         freq_delta=args.freq_delta,
         freq_nfree=args.freq_nfree,
         freq_scale=args.freq_scale,
+        freq_batch_size=args.freq_batch_size,
+        freq_xtb_workers=args.freq_xtb_workers,
         temp=args.temp,
         pressure_atm=args.pressure_atm,
         symmetry_number=args.symmetry_number,
@@ -187,18 +280,21 @@ def main():
         cutoff_cm1=args.cutoff_cm1,
         qrrho_ref_cm1=args.qrrho_ref_cm1,
         qrrho_alpha=args.qrrho_alpha,
-        solv=args.solv,
-        gauss_mem=args.gauss_mem,
-        gauss_nproc=args.gauss_nproc,
+        alpb=args.alpb,
+        alpb_method=args.alpb_method,
+        alpb_concurrent=args.alpb_concurrent,
+        free_volume_solvent=args.free_volume_solvent,
         sella_internal=args.sella_internal,
         sella_eta=args.sella_eta,
         sella_gamma=args.sella_gamma,
         sella_delta0=args.sella_delta0,
         irc=args.irc,
         irc_dx=args.irc_dx,
+        irc_eta=args.irc_eta,
+        irc_gamma=args.irc_gamma,
+        irc_steps=args.irc_steps,
         conc_mol_L=args.conc_mol_l,
         resume_from_per_conformer_csv=True,
-        split_multi_structure=args.split_multi_structure,
     )
 
     if args.manifest:

@@ -43,8 +43,25 @@ def initialize_env():
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 # ---------- Cache and calculator ----------
-def cache_has_files(path: str) -> bool:
-    return os.path.isdir(path) and any(os.scandir(path))
+def cache_has_files(path: str, min_bytes: int = 1 << 20) -> bool:
+    """True only if `path` holds a real, readable model blob.
+
+    A non-empty directory is not enough. The HF layout is snapshots/ full of
+    symlinks into blobs/, and scratch purges delete the blobs while leaving the
+    symlink tree behind — so the cache looks populated but every checkpoint is a
+    dangling link. Resolving one real file of nontrivial size is the honest check,
+    and it decides whether we can safely go offline.
+    """
+    if not os.path.isdir(path):
+        return False
+    for root, _dirs, files in os.walk(path):
+        for name in files:  # os.walk omits dangling symlinks from `files`
+            try:
+                if os.path.getsize(os.path.join(root, name)) >= min_bytes:
+                    return True
+            except OSError:
+                continue
+    return False
 
 def stage_cache_to_local(src: str, dst: str) -> str:
     t0 = time.time()
@@ -177,6 +194,51 @@ def set_charge_mult(atoms: Atoms, charge: int = 0, multiplicity: int = 1):
 def force_metrics_HB(forces_evA: np.ndarray) -> tuple[float, float]:
     mags = np.linalg.norm(forces_evA, axis=1) * EV_A_to_HB
     return float(np.sqrt((mags**2).mean())), float(mags.max())
+
+
+def project_out_rigid_body(positions_A: np.ndarray, forces_evA: np.ndarray) -> np.ndarray:
+    """Remove the net-force and net-torque components of a force array.
+
+    An isolated molecule's energy is invariant to translation and rotation, so
+    those components of the gradient are numerical residue: they change nothing
+    about the structure, and an optimizer working in internal coordinates cannot
+    remove them even in principle.
+
+    UMA leaves a small torque behind — on the test water it is 6.0e-5 Eh/Bohr,
+    which is four times the Tight max-force cutoff, while the part of the gradient
+    that actually deforms the molecule is down at 1.1e-8. Scoring convergence on
+    the raw Cartesian forces therefore made `--opt-mode Tight` unreachable for that
+    molecule no matter how many cycles it was given.
+    """
+    pos = np.asarray(positions_A, dtype=float)
+    n = len(pos)
+    if n < 2:
+        return np.zeros_like(forces_evA)
+
+    d = pos - pos.mean(axis=0)
+    cols = []
+    for k in range(3):
+        v = np.zeros((n, 3))
+        v[:, k] = 1.0
+        cols.append(v.ravel())
+    for k in range(3):
+        e = np.zeros(3)
+        e[k] = 1.0
+        cols.append(np.cross(e, d).ravel())
+
+    B = np.array(cols).T
+    U, s, _ = np.linalg.svd(B, full_matrices=False)
+    U = U[:, s > 1e-8 * s[0]] if s[0] > 0 else U[:, :0]
+
+    f = np.asarray(forces_evA, dtype=float).ravel()
+    return (f - U @ (U.T @ f)).reshape(forces_evA.shape)
+
+
+def internal_force_metrics_HB(
+    positions_A: np.ndarray, forces_evA: np.ndarray
+) -> tuple[float, float]:
+    """``force_metrics_HB`` on the forces that actually deform the molecule."""
+    return force_metrics_HB(project_out_rigid_body(positions_A, forces_evA))
 
 def disp_metrics_bohr(prev_pos_A: Optional[np.ndarray], curr_pos_A: np.ndarray) -> tuple[float, float]:
     if prev_pos_A is None:

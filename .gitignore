@@ -88,3 +88,6 @@ Thumbs.db
 # testfiles
 *.xyz
 *.out
+
+# ...but test fixtures are part of the repo
+!tests/data/*.xyz
