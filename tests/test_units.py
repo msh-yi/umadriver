@@ -248,3 +248,64 @@ def test_batch_common_fields_are_stripped_from_workflow_overrides():
     from umadriver.batch import _BATCH_KEYS
 
     assert set(BatchCommon.__dataclass_fields__) <= _BATCH_KEYS
+
+
+# ------------------------------------------------------------------ CLI routes
+def _run_cli(argv, monkeypatch):
+    """Parse argv through the real CLI, capturing what it would dispatch."""
+    import sys
+
+    import umadriver.driver as drv
+
+    captured = {}
+
+    def _fake_batch(inputs, common, **overrides):
+        captured["overrides"] = overrides
+        return []
+
+    monkeypatch.setattr(drv, "run_batch_from_glob", _fake_batch)
+    monkeypatch.setattr(drv, "initialize_env", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["umadriver", *argv])
+    drv.main()
+    return captured["overrides"]
+
+
+def test_optts_on_the_cli_names_sella(monkeypatch):
+    """--optts must dispatch an optimizer, not None. Passing None left the route
+    and the optimizer disagreeing, which is where `optimizer: null` + `optts:
+    true` got its reputation."""
+    overrides = _run_cli(["mol.xyz", "--optts"], monkeypatch)
+
+    assert overrides["optts"] is True
+    assert overrides["optimizer"] == "Sella"
+
+
+def test_sp_and_optts_conflict(monkeypatch):
+    """--sp means "do not move this geometry" and --optts moves it. Letting one
+    win silently is how a frequency job optimizes away the structure it was
+    given."""
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--sp", "--optts"], monkeypatch)
+
+
+def test_optts_with_another_optimizer_is_rejected(monkeypatch):
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--optts", "--opt", "LBFGS"], monkeypatch)
+
+
+def test_freq_ts_reaches_the_workflow(monkeypatch):
+    """--sp --freq --freq-ts is the documented freq-only-on-a-saddle recipe."""
+    overrides = _run_cli(["ts.xyz", "--sp", "--freq", "--freq-ts"], monkeypatch)
+
+    assert overrides["optimizer"] is None
+    assert overrides["optts"] is False
+    assert overrides["do_freq"] is True
+    assert overrides["freq_ts"] is True
+
+
+def test_freq_ts_defaults_to_letting_the_route_decide(monkeypatch):
+    """Unset must stay None: False would tell a TS job to expect zero imaginary
+    modes and mark every real saddle as imag_ok=False."""
+    overrides = _run_cli(["mol.xyz", "--freq"], monkeypatch)
+
+    assert overrides["freq_ts"] is None

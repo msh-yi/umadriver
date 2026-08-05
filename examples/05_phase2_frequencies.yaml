@@ -6,14 +6,16 @@
 # file you assembled from the conformers worth keeping). The paths below use the
 # shipped fixtures so this file runs as-is.
 #
-# THE ONE THING TO GET RIGHT — `optts` still optimizes.
+# THE ONE THING TO GET RIGHT — `optts` optimizes, whatever `optimizer` says.
 #
-#   optimizer: null   +   optts: true    ->  re-runs the TS search, then frequencies
+#   optimizer: null   +   optts: true    ->  REJECTED at manifest load
 #   optimizer: null   +   optts: false   ->  frequencies only, geometry untouched
 #
-# `optimizer: null` alone does NOT make this a frequency-only job. For a saddle,
-# use `optts: false` and `freq_ts: true`: that leaves the geometry alone and still
-# tells the frequency/thermo path to expect one imaginary mode.
+# `optimizer: null` alone does not make a job frequency-only: optts selects the
+# saddle search and the geometry moves. That pairing used to run and silently
+# replace the structure you pointed it at, so it is now an error. For a saddle,
+# use `optts: false` with `freq_ts: true` — geometry untouched, and the
+# frequency/thermo path still expects one imaginary mode.
 common:
   model: uma-m-1p1
   device: cuda
@@ -43,7 +45,7 @@ jobs:
     out_dir: runs/phase2/hcn_ts_freq
     overrides:
       optimizer: null
-      optts: false      # <- not `true`; see the note above
+      optts: false      # <- `true` here would re-optimize; see the note above
       do_freq: true
       freq_ts: true     # <- score this as a TS: one imaginary mode is expected
       temp: 343.15

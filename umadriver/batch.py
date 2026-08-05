@@ -391,6 +391,32 @@ def _worker_loop(
 _BATCH_KEYS = set(BatchCommon.__dataclass_fields__.keys())
 
 
+def _reject_ambiguous_ts_route(xyz: str, job_keys: Dict[str, Any]) -> None:
+    """Refuse a job that writes ``optimizer: null`` next to ``optts: true``.
+
+    That pairing reads as "no optimization, and it's a transition state", which is
+    what people mean by it. It is not what it does: optts selects the saddle
+    search and the geometry gets re-optimized, quietly discarding the structure
+    the job was pointed at. Nothing downstream reveals this — the run succeeds and
+    the numbers look reasonable.
+
+    Only an *explicitly written* null counts, so `--optts` on the command line and
+    a plain `optts: true` in a manifest are unaffected.
+    """
+    if not job_keys.get("optts"):
+        return
+    if "optimizer" not in job_keys or job_keys["optimizer"] is not None:
+        return
+    raise RuntimeError(
+        f"{xyz}: `optimizer: null` with `optts: true` is ambiguous.\n"
+        "  optts selects a saddle search, so this job WOULD re-optimize the "
+        "geometry despite the null optimizer.\n"
+        "  - to optimize to a TS:            drop `optimizer: null`\n"
+        "  - for frequencies on this exact\n"
+        "    geometry, left untouched:       `optts: false` + `freq_ts: true`"
+    )
+
+
 def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overrides):
     cfg = _load_manifest(manifest_path)
     try:
@@ -459,6 +485,7 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
             **flattened,
             **job_overrides,
         }
+        _reject_ambiguous_ts_route(xyz, {**flattened, **job_overrides})
         jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides})
 
     jobs = _expand_jobs_with_splitting(jobs, split_multi, resume=resume)

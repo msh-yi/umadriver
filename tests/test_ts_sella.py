@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 
+import numpy as np
 import pytest
 
 from umadriver.ensemble import run_conformer_workflow
@@ -124,3 +125,63 @@ def test_catalyst_ts_completes(tmp_path, catalyst_ts_xyz, uma_calc, energies):
     negative = [f for f in freqs if f < 0.0]
     assert len(negative) == 1
     assert abs(negative[0]) > 100.0
+
+
+# ---------------------------------------------------------------- route rules
+def test_optts_rejects_a_non_sella_optimizer(tmp_path, hcn_ts_xyz, uma_calc):
+    """The saddle search is Sella-only, so `optts=True, optimizer="LBFGS"` cannot
+    be honored. It used to be accepted and the optimizer silently ignored."""
+    with pytest.raises(ValueError, match="Sella-only"):
+        run_conformer_workflow(
+            hcn_ts_xyz,
+            out_dir=str(tmp_path / "bad"),
+            optimizer="LBFGS",
+            optts=True,
+            calc=uma_calc,
+        )
+
+
+def test_optts_implies_sella(tmp_path, hcn_ts_xyz, uma_calc, energies):
+    """`optts=True` alone is the ordinary spelling and must still run the TS
+    route — the workflow fills in Sella rather than falling through to SP."""
+    csv_path = run_conformer_workflow(
+        hcn_ts_xyz,
+        out_dir=str(tmp_path / "ts"),
+        optts=True,
+        maxcycles=300,
+        calc=uma_calc,
+    )
+    assert energies(csv_path)[0]["route"] == "TS"
+
+
+def test_freq_ts_scores_a_saddle_without_moving_it(tmp_path, hcn_ts_xyz, uma_calc, energies):
+    """The recommended freq-only spelling: no optimization, still judged as a TS.
+
+    `steps == 0` is the assertion that matters — it is what distinguishes this
+    from `optts: true`, which would re-optimize and quietly replace the geometry
+    the job was pointed at.
+    """
+    from ase.io import read as ase_read
+
+    before = ase_read(hcn_ts_xyz).get_positions()
+
+    csv_path = run_conformer_workflow(
+        hcn_ts_xyz,
+        out_dir=str(tmp_path / "freqonly"),
+        optimizer=None,
+        optts=False,
+        do_freq=True,
+        freq_ts=True,
+        calc=uma_calc,
+    )
+
+    r = energies(csv_path)[0]
+    assert r["route"] == "SP"
+    assert int(r["steps"]) == 0
+    assert int(r["n_imag"]) == 1
+    assert r["imag_ok"] == "True", "freq_ts=True must expect one imaginary mode"
+
+    after = ase_read(
+        os.path.join(tmp_path / "freqonly", "per_struct_hcn_ts", "hcn_ts_conf_0000.xyz")
+    ).get_positions()
+    np.testing.assert_allclose(after, before, atol=1e-10)

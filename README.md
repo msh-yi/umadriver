@@ -118,7 +118,13 @@ umadriver batch --manifest jobs.yaml
 
 > **`--opt` is required to optimize.** With no `--opt`, `optimizer` is `None` and the
 > route is a **single point**, not an optimization. `--optts` is the exception: it
-> selects the TS route on its own (TS always uses Sella, `order=1`).
+> selects the TS route on its own and implies Sella (`order=1`).
+>
+> **`--optts` is a saddle *search*, not a label — the geometry moves.** For
+> frequencies on a TS you do not want touched, use `--sp --freq --freq-ts`.
+> `--sp --optts` and `--optts --opt LBFGS` are rejected rather than silently
+> resolved, and a manifest pairing `optimizer: null` with `optts: true` is an
+> error at load time.
 
 **Outputs**  
 By default, each input's results go to `<out-root>/<basename>.ensemble/` (`--out-root`
@@ -153,11 +159,15 @@ thermochemistry summary (qRRHO on by default).
   - `--opt OPT`: optimizer (`Sella`, `LBFGS`, `BFGS`, `BFGSLineSearch`, `FIRE`, `QuasiNewton`).
     If omitted, defaults to optimization unless `--sp` is given.
   - `--sp`: single-point only (no optimization).
-  - `--optts`: TS optimization (1st-order saddle; uses Sella).
+  - `--optts`: optimize to a 1st-order saddle. Implies Sella; conflicts with `--sp`
+    and with any other `--opt`.
   - `--opt-mode {Loose,Normal,Tight,VeryTight}` *(default: Normal)*.
   - `--maxcycles INT` *(default: 300)*.
 - **Frequencies / Thermo**
   - `--freq`: run vibrational analysis.
+  - `--freq-ts`: score the result as a transition state (one imaginary mode expected)
+    without optimizing. Use with `--sp` for frequencies on a saddle you want left
+    exactly as given. By default the route decides.
   - `--freq-delta FLOAT` *(Å, default 0.01)*, `--freq-nfree 2`, `--freq-scale FLOAT`.
   - `--freq-batch-size INT` *(default 1)*: evaluate the `2×3N` finite-difference
     displacements in batches instead of one forward pass at a time. A 170-atom molecule
@@ -295,6 +305,19 @@ jobs:
       do_freq: true
       temp: 343.15
       pressure_atm: 1.0
+
+  # The same, on a transition state. Note `optts: false` — writing `optts: true`
+  # here would re-run the saddle search and replace the geometry; `freq_ts` is how
+  # you say "expect one imaginary mode" without optimizing. (`optimizer: null`
+  # alongside `optts: true` is rejected at load time for exactly this reason.)
+  - xyz: path/to/ts_freq_only.xyz
+    out_dir: runs/ts_freq_only
+    overrides:
+      optimizer: null
+      optts: false
+      freq_ts: true
+      do_freq: true
+      temp: 343.15
 ```
 
 Run it:
@@ -469,6 +492,15 @@ See `LICENSE` in this repository.
 ## Changelog
 
 - **Unreleased**
+  - **`optts` and `optimizer` can no longer disagree.** `optts` selects a saddle
+    search and always used Sella, so any other `optimizer` was silently ignored and
+    `optimizer: null` was ignored too — meaning a job written to say "frequencies on
+    this TS, don't move it" re-ran the optimization and replaced the geometry, with
+    nothing in the output to show it. `optts` now implies Sella; `--sp --optts`,
+    `--optts --opt LBFGS`, and a manifest pairing `optimizer: null` with
+    `optts: true` are all errors, the last one at load time before any GPU work.
+    Frequencies on an unmoved saddle are `--sp --freq --freq-ts` (`optts: false` +
+    `freq_ts: true`), and `--freq-ts` is newly exposed on the CLI.
   - **`--opt-mode Tight` was unreachable for some molecules.** Convergence was judged
     on raw Cartesian forces, which carry translation and rotation components UMA does
     not cancel exactly. Those change nothing about a structure, and Sella's internal

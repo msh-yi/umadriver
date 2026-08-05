@@ -209,6 +209,79 @@ def test_manifest_path_splits_multi_conformer_jobs(tmp_path, monkeypatch):
     assert all(j["overrides"]["optts"] is True for j in jobs)
 
 
+def test_manifest_rejects_null_optimizer_with_optts(tmp_path, monkeypatch):
+    """`optimizer: null` + `optts: true` reads as "don't optimize, it's a TS".
+
+    It is not: optts selects the saddle search, so the job re-optimizes and throws
+    away the geometry it was handed. Nothing downstream shows this — the run
+    succeeds and the numbers look fine — so it has to fail at manifest load,
+    before any GPU time is spent.
+    """
+    xyz = _xyz(tmp_path, "confs_for_freq.xyz", 2)
+    manifest = tmp_path / "jobs.yaml"
+    manifest.write_text(
+        "jobs:\n"
+        f"- xyz: {xyz}\n"
+        f"  out_dir: {tmp_path}/freq\n"
+        "  overrides:\n"
+        "    optimizer: null\n"
+        "    optts: true\n"
+        "    do_freq: true\n"
+    )
+
+    _capture_jobs(monkeypatch)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        run_batch_from_manifest(str(manifest), BatchCommon(out_root=str(tmp_path)))
+
+
+def test_manifest_rejects_the_flattened_spelling_too(tmp_path, monkeypatch):
+    """Same pairing without an `overrides:` block must not slip through."""
+    xyz = _xyz(tmp_path, "confs.xyz", 1)
+    manifest = tmp_path / "jobs.yaml"
+    manifest.write_text(
+        f"jobs:\n- xyz: {xyz}\n  optimizer: null\n  optts: true\n  do_freq: true\n"
+    )
+
+    _capture_jobs(monkeypatch)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        run_batch_from_manifest(str(manifest), BatchCommon(out_root=str(tmp_path)))
+
+
+def test_manifest_allows_optts_without_naming_an_optimizer(tmp_path, monkeypatch):
+    """Only an explicitly written null is ambiguous. `optts: true` on its own is
+    the ordinary way to ask for a TS search and must keep working."""
+    xyz = _xyz(tmp_path, "ts.xyz", 1)
+    manifest = tmp_path / "jobs.yaml"
+    manifest.write_text(f"jobs:\n- xyz: {xyz}\n  out_dir: {tmp_path}/ts\n  optts: true\n")
+
+    seen = _capture_jobs(monkeypatch)
+    run_batch_from_manifest(str(manifest), BatchCommon(out_root=str(tmp_path)))
+
+    assert len(seen["jobs"]) == 1
+
+
+def test_manifest_allows_freq_only_on_a_saddle(tmp_path, monkeypatch):
+    """The spelling the error message recommends has to actually be accepted."""
+    xyz = _xyz(tmp_path, "confs_for_freq.xyz", 2)
+    manifest = tmp_path / "jobs.yaml"
+    manifest.write_text(
+        "jobs:\n"
+        f"- xyz: {xyz}\n"
+        f"  out_dir: {tmp_path}/freq\n"
+        "  overrides:\n"
+        "    optimizer: null\n"
+        "    optts: false\n"
+        "    freq_ts: true\n"
+        "    do_freq: true\n"
+    )
+
+    seen = _capture_jobs(monkeypatch)
+    run_batch_from_manifest(str(manifest), BatchCommon(out_root=str(tmp_path)))
+
+    assert len(seen["jobs"]) == 2
+    assert all(j["overrides"]["freq_ts"] is True for j in seen["jobs"])
+
+
 def test_manifest_respects_split_disabled(tmp_path, monkeypatch):
     xyz = _xyz(tmp_path, "confs.xyz", 3)
     manifest = tmp_path / "jobs.yaml"

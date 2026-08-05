@@ -483,8 +483,20 @@ def run_conformer_workflow(
         per_conf_csv,
     )
 
-    # Decide route kind (primarily for logging + defaults)
+    # Decide the route. Exactly one of TS / SP / OPT, and `optimizer` is made to
+    # agree with it so the two can never describe different things.
+    #
+    # optts selects a first-order saddle search, which this package only
+    # implements with Sella (order=1) — so optts implies Sella rather than
+    # leaving `optimizer` to say something that will be ignored.
     if optts:
+        if optimizer not in (None, "Sella"):
+            raise ValueError(
+                f"optts=True runs a saddle search, which is Sella-only; got "
+                f"optimizer={optimizer!r}. Drop the optimizer, or set optts=False "
+                f"to minimize with {optimizer!r} instead."
+            )
+        optimizer = "Sella"
         route_kind = "TS"
     elif optimizer is None:
         route_kind = "SP"

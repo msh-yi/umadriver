@@ -139,8 +139,26 @@ def main():
         default=None,
         help="Optimizer to use. If omitted: default is OPT unless --freq is passed alone (then SP).",
     )
-    p.add_argument("--sp", action="store_true")
-    p.add_argument("--optts", action="store_true")
+    p.add_argument(
+        "--sp",
+        action="store_true",
+        help="Single point: no optimization. Pair with --freq-ts for frequencies "
+        "on a transition state you do not want moved.",
+    )
+    p.add_argument(
+        "--optts",
+        action="store_true",
+        help="Optimize to a first-order saddle. Implies Sella (order=1) — it is a "
+        "saddle search, not a label, so the geometry WILL move.",
+    )
+    p.add_argument(
+        "--freq-ts",
+        dest="freq_ts",
+        action="store_true",
+        default=None,
+        help="Score the frequency job as a transition state (expect one imaginary "
+        "mode) without optimizing. Use with --sp; the route decides by default.",
+    )
     p.add_argument("--maxcycles", type=int, default=300)
 
     p.add_argument("--sella-internal", dest="sella_internal", action="store_true")
@@ -238,6 +256,21 @@ def main():
 
     args = p.parse_args(_strip_batch_token(sys.argv[1:]))
 
+    # --sp says "do not move the geometry" and --optts says "search for a saddle".
+    # They cannot both be honored, and silently letting one win is how a job ends
+    # up optimizing a structure the user meant to leave alone.
+    if args.sp and args.optts:
+        p.error(
+            "--sp and --optts conflict: --optts optimizes to a saddle. For "
+            "frequencies on a TS geometry you do not want moved, use --sp "
+            "--freq --freq-ts."
+        )
+    if args.optts and args.opt not in (None, "Sella"):
+        p.error(
+            f"--optts is a saddle search and is Sella-only; got --opt {args.opt}. "
+            "Drop --opt, or drop --optts to minimize instead."
+        )
+
     setup_logging(verbose=args.verbose, debug=args.debug)
     # Sets HF_HUB_OFFLINE=1 when the model cache is already populated, so a healthy
     # run doesn't depend on the Hub being reachable (or the token being current).
@@ -262,11 +295,14 @@ def main():
     overrides = dict(
         charge=args.charge,
         mult=args.mult,
-        optimizer=(None if args.sp else args.opt),
+        # --optts implies Sella; say so here rather than passing None and relying
+        # on the workflow to infer it.
+        optimizer=("Sella" if args.optts else (None if args.sp else args.opt)),
         opt_mode=args.opt_mode,
         optts=args.optts,
         maxcycles=args.maxcycles,
         do_freq=args.freq,
+        freq_ts=args.freq_ts,
         freq_delta=args.freq_delta,
         freq_nfree=args.freq_nfree,
         freq_scale=args.freq_scale,

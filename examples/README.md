@@ -55,7 +55,10 @@ in jobs that say otherwise.
 
 **`optts: true` optimizes, even with `optimizer: null`.** It selects a saddle
 search, not a labelling. For frequencies on a TS geometry you do not want moved,
-use `optts: false` with `freq_ts: true`. Example 05 spells this out.
+use `optts: false` with `freq_ts: true` (CLI: `--sp --freq --freq-ts`). Example 05
+spells this out. Writing `optimizer: null` next to `optts: true` used to run and
+quietly replace your geometry; it is now rejected at manifest load, before any GPU
+time is spent. `--sp --optts` and `--optts --opt LBFGS` are likewise refused.
 
 **A TS is not a TS until the frequencies say so.** A saddle search converges to
 plenty of things that are not first-order saddles. Check `n_imag == 1` in
