@@ -1,0 +1,36 @@
+# 01 — Optimize an ensemble and rank it by energy.
+#
+#   umadriver --manifest examples/01_optimize_conformers.yaml --out-root runs
+#
+# The starting point for almost everything: take a multi-conformer XYZ, minimize
+# every structure, and get them back ranked.
+#
+# `common:` sets defaults for every job. Anything a job does not mention is
+# inherited from here, and anything it does mention wins.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+jobs:
+  # A three-conformer water file — small enough to finish in seconds, so you can
+  # confirm your install works before pointing this at a real system.
+  - xyz: tests/data/h2o_ens.xyz
+    # No out_dir, so output lands in <--out-root>/h2o_ens.ensemble. Setting
+    # out_dir here would pin the path and make --out-root do nothing; example 04
+    # does that deliberately.
+    overrides:
+      charge: 0
+      mult: 1
+      optimizer: Sella      # Sella is the default and handles floppy systems well
+      opt_mode: Normal      # Loose | Normal | Tight | VeryTight
+      maxcycles: 300
+
+# What you get in runs/h2o_ens.ensemble/:
+#
+#   energies.csv                    every conformer, ranked, with rel_kcal
+#   optimized_ranked.xyz            the same structures in ranked order
+#   per_struct_h2o_ens/             one XYZ per conformer
+#   energies_per_conformer_*.csv    the resume ledger — delete it to force a rerun
+#
+# Re-running the same command skips finished jobs (--resume is on by default).
+# Use --no-resume to recompute from scratch.

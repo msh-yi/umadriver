@@ -91,3 +91,6 @@ Thumbs.db
 
 # ...but test fixtures are part of the repo
 !tests/data/*.xyz
+
+# default --out-root, and where the examples/ manifests write
+runs/

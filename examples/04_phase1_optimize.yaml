@@ -1,0 +1,56 @@
+# 04 — Phase 1 of the two-phase pattern: optimize everything.
+#
+#   umadriver --manifest examples/04_phase1_optimize.yaml --workers-per-gpu 2
+#
+# Unlike examples 01-02, the jobs here pin `out_dir:` explicitly, because phase 2
+# has to point back at these paths. That means --out-root has no effect on this
+# manifest — an explicit out_dir always wins.
+#
+# Frequencies cost 6N gradient calls per structure, so running them on a whole
+# conformer ensemble is usually wasted work — most conformers get discarded on
+# energy. The cheap pattern is: optimize everything here, look at energies.csv,
+# then run frequencies only on the survivors (example 05).
+#
+# How the work is spread: every structure in every file becomes its own job on one
+# shared queue, and workers pull from it. Uneven costs self-balance, so a 5-atom
+# job finishing early frees its worker for the next structure rather than idling.
+# A single 50-conformer file therefore fans out across all your GPUs.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+  # Two workers per GPU hides inference latency on a large card; VRAM cost scales
+  # linearly, so drop to 1 if you see OOM. The CPU thread budget is divided among
+  # workers automatically.
+  workers_per_gpu: 2
+
+  # On by default. Set false only if a file must be processed as one unit.
+  split_multi_structure: true
+
+jobs:
+  # Ordinary minima.
+  - xyz: tests/data/h2o_ens.xyz
+    out_dir: runs/phase1/water_ensemble
+    overrides:
+      charge: 0
+      mult: 1
+      optimizer: Sella
+      opt_mode: Normal
+      maxcycles: 300
+
+  # Saddle points in the same run. Per-job settings override `common:`, so mixed
+  # job types coexist happily in one manifest.
+  - xyz: tests/data/hcn_ts.xyz
+    out_dir: runs/phase1/hcn_ts
+    overrides:
+      charge: 0
+      optimizer: Sella
+      optts: true
+      maxcycles: 300
+
+# Then look at runs/phase1/*/energies.csv, keep what you want, and feed those
+# geometries to example 05.
+#
+# If a job reports converged=False, the log now names which criteria it missed and
+# by how much — that is the difference between "raise --maxcycles" and "this will
+# never converge, change --opt-mode".

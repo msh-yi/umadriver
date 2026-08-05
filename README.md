@@ -78,6 +78,12 @@ Declared in `pyproject.toml`:
 
 ## Quickstart (CLI)
 
+> New here? [`examples/`](examples/) has five annotated manifests that run as-is
+> against the structures in `tests/data/` — optimization, TS + IRC, implicit
+> solvent, and the optimize-then-frequencies pipeline. Start with
+> [`examples/01_optimize_conformers.yaml`](examples/01_optimize_conformers.yaml)
+> to confirm your install works before pointing anything at a real system.
+
 XYZ inputs are **positional** (one or more paths and/or glob patterns). There is no
 `--xyz` flag and no `batch` subcommand — the ensemble/batch workflow is the only mode.
 

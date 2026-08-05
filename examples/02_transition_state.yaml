@@ -1,0 +1,42 @@
+# 02 — Transition state: optimize to the saddle, verify it, then follow it down.
+#
+#   umadriver --manifest examples/02_transition_state.yaml --out-root runs
+#
+# `optts: true` switches Sella to a first-order saddle search (order=1). Always
+# pair it with `do_freq: true`: a TS search will happily converge to something
+# that is not a saddle, and the frequency job is what tells you. Check `n_imag`
+# in energies.csv — it must be exactly 1.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+jobs:
+  # HCN <-> HNC isomerization: 3 atoms, one unambiguous imaginary mode.
+  - xyz: tests/data/hcn_ts.xyz
+    overrides:
+      charge: 0
+      mult: 1
+      optimizer: Sella
+      optts: true
+      maxcycles: 300
+
+      do_freq: true
+      temp: 298.15
+      pressure_atm: 1.0
+
+      # Follow the imaginary mode downhill in both directions to prove the saddle
+      # connects the reactants and products you think it does. The IRC is skipped
+      # automatically when the frequency job does not find exactly one imaginary
+      # mode, so it never runs on a structure that is not a TS.
+      irc: true
+      irc_dx: 0.1
+
+# What you get in runs/hcn_ts.ensemble/, on top of the usual ensemble outputs:
+#
+#   freq_out/conf_0000.out       ORCA-format frequencies + thermochemistry
+#   irc/conf_0000_irc_path.xyz   both IRC legs stitched into one trajectory
+#   irc/conf_0000_irc.csv        energy vs. arc length along the path
+#   irc/*_traj_fwd.traj, _rev    the two legs as ASE trajectories
+#
+# Sanity check before you trust anything downstream:
+#   n_imag == 1, and the imaginary mode looks like the bond being made/broken.

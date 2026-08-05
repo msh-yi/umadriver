@@ -1,0 +1,51 @@
+# 03 — Implicit solvent (ALPB), and the two ways to ask for it.
+#
+#   umadriver --manifest examples/03_implicit_solvent.yaml --out-root runs
+#
+# Needs tblite:  pip install tblite   (or: conda install -c conda-forge tblite-python)
+#
+#   E = E_UMA + (E_xtb,alpb - E_xtb,vacuum)
+#
+# The correction is a difference of two xtb calculations at the same geometry with
+# the same Hamiltonian, so most of xtb's intrinsic error cancels and what survives
+# is the solvation response. It applies to every force as well as every energy, so
+# the geometry optimizes *in solvent* rather than in vacuum with an energy shift
+# bolted on afterwards.
+#
+# Two honest caveats: the correction comes from GFN2, not from UMA's reference
+# level, so its transferability is an assumption; and ALPB values for charged
+# species are large (tens of kcal/mol) and less reliable than for neutrals.
+#
+# Cost: the xtb work runs on CPU threads while UMA runs on the GPU, so a solvated
+# force call costs ~1.2x a gas-phase one rather than ~3x. Check `solv_corr_kcal`
+# in energies.csv — for a neutral organic in water expect roughly -5 to -15
+# kcal/mol. A *positive* value for a neutral means something is wrong.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+jobs:
+  # Optimize in water. Note this is a different structure from the gas-phase
+  # minimum, not the same structure with a correction added.
+  - xyz: tests/data/h2o_ens.xyz
+    out_dir: runs/water_in_water   # explicit path; overrides --out-root
+    overrides:
+      optimizer: Sella
+      opt_mode: Normal
+      alpb: water
+      alpb_method: GFN2-xTB   # or GFN1-xTB / GFN-FF. ALPB has no GFN0 parameters.
+
+  # Solvated single point on a fixed geometry — the flattened style, no
+  # `overrides:` block. Handy for one-liners.
+  - xyz: tests/data/hcn_ts.xyz
+    optimizer: null           # no optimization; same effect as CLI --sp
+    do_freq: false
+    alpb: acetonitrile
+
+# Resume safety: energies.csv records which solvent produced each row, and a
+# resumed run refuses to reuse a gas-phase energy for a solvated job (or the
+# reverse). It recomputes instead of silently mixing the two.
+#
+# Unrelated flag, easy to confuse: --free-volume-solvent changes the standard
+# state used for translational entropy and only does anything alongside
+# conc_mol_L (see example 05). It is not a solvation energy.

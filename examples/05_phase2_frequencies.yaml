@@ -1,0 +1,67 @@
+# 05 — Phase 2: frequencies and thermochemistry on already-optimized geometries.
+#
+#   umadriver --manifest examples/05_phase2_frequencies.yaml --freq-batch-size 8
+#
+# Point `xyz:` at geometries phase 1 already converged (optimized_ranked.xyz, or a
+# file you assembled from the conformers worth keeping). The paths below use the
+# shipped fixtures so this file runs as-is.
+#
+# THE ONE THING TO GET RIGHT — `optts` still optimizes.
+#
+#   optimizer: null   +   optts: true    ->  re-runs the TS search, then frequencies
+#   optimizer: null   +   optts: false   ->  frequencies only, geometry untouched
+#
+# `optimizer: null` alone does NOT make this a frequency-only job. For a saddle,
+# use `optts: false` and `freq_ts: true`: that leaves the geometry alone and still
+# tells the frequency/thermo path to expect one imaginary mode.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+jobs:
+  # --- Minimum: expect n_imag == 0 ---
+  - xyz: tests/data/h2o_ens.xyz
+    out_dir: runs/phase2/water_freq
+    overrides:
+      optimizer: null
+      optts: false
+      do_freq: true
+      freq_ts: false
+
+      # Thermochemistry at the temperature the reaction is actually run at.
+      temp: 343.15
+      pressure_atm: 1.0
+      symmetry_number: 1
+
+      # quasi-RRHO (Grimme) damps the entropy of low-frequency modes, where the
+      # harmonic approximation badly overestimates it. On by default.
+      qrrho: true
+      qrrho_ref_cm1: 100.0
+
+  # --- Saddle: geometry untouched, expect n_imag == 1 ---
+  - xyz: tests/data/hcn_ts.xyz
+    out_dir: runs/phase2/hcn_ts_freq
+    overrides:
+      optimizer: null
+      optts: false      # <- not `true`; see the note above
+      do_freq: true
+      freq_ts: true     # <- score this as a TS: one imaginary mode is expected
+      temp: 343.15
+
+      # Standard-state correction for a solution-phase concentration. Without
+      # conc_mol_L the translational entropy is the ideal-gas 1 atm value, which
+      # overstates it in solution by several kcal/mol.
+      conc_mol_L: 0.00075
+      # Optional refinement: use the solvent's free volume rather than the whole
+      # litre. Unrelated to --alpb; only does anything alongside conc_mol_L.
+      free_volume_solvent: toluene
+
+# Speed: --freq-batch-size N evaluates N finite-difference displacements per
+# forward pass instead of one at a time. It costs VRAM and backs off automatically
+# on OOM, so start at 8 and raise it. On a 170-atom system this is the difference
+# between a coffee and a lunch break. It works under --alpb too, overlapping the
+# batched GPU Hessian with threaded CPU xtb.
+#
+# Read from freq_out/conf_0000.out (ORCA format, so existing viewers parse it):
+#   VIBRATIONAL FREQUENCIES   the modes, with rigid-body ones zeroed
+#   THERMOCHEMISTRY           ZPE, H, S, and the final Gibbs free energy
