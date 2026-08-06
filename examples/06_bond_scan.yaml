@@ -1,0 +1,65 @@
+# 06 — Relaxed scan along a bond, and what to do with the result.
+#
+#   umadriver --manifest examples/06_bond_scan.yaml
+#
+# Walk the distance between two atoms from one value to another. At each point the
+# bond is held fixed and everything else is minimized, so the profile is a real
+# slice through the PES rather than a rigid stretch. Each point starts from the
+# previous relaxed geometry, which keeps the path continuous.
+#
+# ATOMS ARE NUMBERED FROM 1 — the first atom in the XYZ is atom 1, matching what
+# your structure viewer shows you. tests/data/h2o.xyz is:
+#
+#   1  O
+#   2  H
+#   3  H
+#
+# so `i: 1, j: 2` is an O-H bond.
+#
+# The usual reason to run one is to get a transition-state guess when --optts from
+# a hand-built structure will not converge:
+#
+#   1. scan the bond being made or broken, straddling where you think the barrier is
+#   2. take scan/<tag>_scan_max.xyz — the highest point on the profile
+#   3. umadriver that file with --optts --freq, and check n_imag == 1
+#
+# The scan itself never gives you a transition state: every point is constrained,
+# so none of them is a stationary point.
+common:
+  model: uma-m-1p1
+  device: cuda
+
+jobs:
+  # Mapping form — reads best, and is the one to use in real manifests.
+  - xyz: tests/data/h2o.xyz
+    out_dir: runs/scan_OH
+    overrides:
+      scan: {i: 1, j: 2, from: 0.85, to: 1.60, steps: 16}
+      opt_mode: Normal      # applies to the constrained minimization at each point
+      maxcycles: 200
+      # optimizer defaults to Sella when a scan is requested; you do not need to
+      # ask for one, but --opt LBFGS etc. works if you prefer.
+
+  # The same thing written as the CLI's five positional values, which is what
+  # `--scan 1 3 0.85 1.6 16` produces. Both forms parse identically.
+  - xyz: tests/data/h2o.xyz
+    out_dir: runs/scan_OH_other
+    scan: [1, 3, 0.85, 1.60, 16]
+
+# What you get in each out_dir:
+#
+#   scan/conf_0000_scan.csv       point, target_A, actual_A, energy_Eh, rel_kcal,
+#                                 converged, steps  <- this is the actual product
+#   scan/conf_0000_scan.xyz       every point as a frame, for animating the path
+#   scan/conf_0000_scan_max.xyz   the highest point alone — the TS guess
+#
+# `actual_A` is the distance the point really ended at, not the one requested.
+# They differ slightly because Sella satisfies constraints to a tolerance; a
+# warning fires if any point drifts more than 1e-3 A off its target.
+#
+# energies.csv gets a row per conformer as always, with route=SCAN, but it is only
+# a summary: the energy is the last scan point and `converged` means every point
+# converged. The profile is the result — read the CSV above.
+#
+# --freq on a scan warns and --irc is skipped: a constrained endpoint is not a
+# stationary point, so frequencies there carry spurious imaginary modes.

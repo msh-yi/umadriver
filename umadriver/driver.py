@@ -61,6 +61,7 @@ from .utils import setup_logging, mode_type, optimizer_type, initialize_env
 from .constants import DEFAULT_FAIRCHEM_CACHE, VAST_BASE
 from .batch import BatchCommon, run_batch_from_manifest, run_batch_from_glob
 from .vib_thermo import FREE_VOLUME_SOLVENTS
+from .scan import parse_scan_spec
 from .solvation import ALPB_METHODS
 
 LOG = logging.getLogger("umadriver")
@@ -160,6 +161,17 @@ def main():
         "mode) without optimizing. Use with --sp; the route decides by default.",
     )
     p.add_argument("--maxcycles", type=int, default=300)
+    p.add_argument(
+        "--scan",
+        nargs=5,
+        metavar=("I", "J", "FROM", "TO", "STEPS"),
+        default=None,
+        help="Relaxed scan of the distance between atoms I and J, from FROM to TO "
+        "angstroms in STEPS points. Atoms are numbered from 1 (the first atom in "
+        "the file is 1). At each point the bond is held fixed and everything else "
+        "is minimized. Writes scan/<tag>_scan.csv, the path as an XYZ trajectory, "
+        "and the highest point on its own as a TS guess for --optts.",
+    )
 
     p.add_argument("--sella-internal", dest="sella_internal", action="store_true")
     p.add_argument("--no-sella-internal", dest="sella_internal", action="store_false")
@@ -270,6 +282,25 @@ def main():
             f"--optts is a saddle search and is Sella-only; got --opt {args.opt}. "
             "Drop --opt, or drop --optts to minimize instead."
         )
+    if args.scan is not None:
+        if args.optts:
+            p.error(
+                "--scan and --optts are different routes: a scan walks a "
+                "coordinate with the bond constrained, --optts searches for a "
+                "saddle with everything free. Scan first, then run --optts on the "
+                "scan/*_scan_max.xyz it writes."
+            )
+        if args.sp:
+            p.error(
+                "--scan and --sp conflict: every scan point is a constrained "
+                "minimization, so a scan moves atoms by definition."
+            )
+        # Fail here, on one structure's worth of argv, rather than inside a worker
+        # once the batch is already running.
+        try:
+            parse_scan_spec(args.scan)
+        except ValueError as e:
+            p.error(str(e))
 
     setup_logging(verbose=args.verbose, debug=args.debug)
     # Sets HF_HUB_OFFLINE=1 when the model cache is already populated, so a healthy
@@ -301,6 +332,7 @@ def main():
         opt_mode=args.opt_mode,
         optts=args.optts,
         maxcycles=args.maxcycles,
+        scan=args.scan,
         do_freq=args.freq,
         freq_ts=args.freq_ts,
         freq_delta=args.freq_delta,

@@ -26,6 +26,7 @@ from .utils import (
     resolve_device,
     build_calculator,
 )
+from .scan import parse_scan_spec, run_bond_scan
 from .vib_thermo import (
     run_frequencies_and_write,
     rrho_thermo,
@@ -402,6 +403,9 @@ def run_conformer_workflow(
     opt_mode: Literal["Loose", "Normal", "Tight", "VeryTight"] = "Normal",
     optts: bool = False,
     maxcycles: int = 300,
+    # Relaxed scan along a bond distance: [i, j, from, to, steps] with atoms
+    # numbered from 1, or {i, j, from, to, steps}. See umadriver.scan.
+    scan: Optional[Any] = None,
     # frequency / thermo
     do_freq: bool = False,
     freq_ts: Optional[
@@ -483,13 +487,27 @@ def run_conformer_workflow(
         per_conf_csv,
     )
 
-    # Decide the route. Exactly one of TS / SP / OPT, and `optimizer` is made to
-    # agree with it so the two can never describe different things.
+    # Decide the route. Exactly one of SCAN / TS / SP / OPT, and `optimizer` is
+    # made to agree with it so the two can never describe different things.
     #
     # optts selects a first-order saddle search, which this package only
     # implements with Sella (order=1) — so optts implies Sella rather than
     # leaving `optimizer` to say something that will be ignored.
-    if optts:
+    scan_spec = parse_scan_spec(scan) if scan is not None else None
+    if scan_spec is not None:
+        if optts:
+            raise ValueError(
+                "scan and optts are different routes: a scan walks a coordinate "
+                "with the bond constrained, optts searches for a saddle with "
+                "everything free. Run the scan first, then point --optts at the "
+                "*_scan_max.xyz it writes."
+            )
+        # Every scan point is a constrained *minimization*, so the scan needs an
+        # optimizer whether or not one was asked for.
+        if optimizer is None:
+            optimizer = "Sella"
+        route_kind = "SCAN"
+    elif optts:
         if optimizer not in (None, "Sella"):
             raise ValueError(
                 f"optts=True runs a saddle search, which is Sella-only; got "
@@ -512,6 +530,15 @@ def run_conformer_workflow(
     LOG.info("Input: %s", xyz_path)
     LOG.info("Outdir: %s", out_dir)
     LOG.info("Route kind: %s", route_kind)
+    if route_kind == "SCAN":
+        LOG.info("Scan: %s", scan_spec.describe())
+        if do_freq:
+            LOG.warning(
+                "  [SCAN] --freq will run on the LAST scan point, which is a "
+                "constrained geometry and not a stationary point. Expect spurious "
+                "imaginary modes and meaningless thermochemistry. For a real "
+                "barrier, feed scan/*_scan_max.xyz to --optts --freq instead."
+            )
     LOG.info("Scratch: %s", job_scratch)
 
     frames: List[Atoms] = ase_read(xyz_path, index=":")
@@ -711,7 +738,33 @@ def run_conformer_workflow(
         a.info.update({"charge": charge, "spin": mult})
         a.calc = calc
 
-        if route_kind == "TS":
+        if route_kind == "SCAN":
+
+            def _relax(atoms_to_relax: Atoms):
+                return _minimize_atoms_inplace(
+                    atoms_to_relax,
+                    optimizer=optimizer,  # type: ignore[arg-type]
+                    opt_mode=opt_mode,
+                    maxcycles=maxcycles,
+                    sella=sella if optimizer == "Sella" else None,
+                )
+
+            points = run_bond_scan(
+                a,
+                scan_spec,
+                relax=_relax,
+                out_dir=os.path.join(out_dir, "scan"),
+                tag=tag,
+            )
+            # The row below is a summary, not a result — the profile in
+            # scan/<tag>_scan.csv is the product. Energy is the last point (which
+            # is the geometry `a` now holds, and the one written to
+            # per_struct/optimized_ranked), but `converged` covers *every* point:
+            # a row claiming success while three points failed would be a lie.
+            E_h = points[-1]["energy_Eh"]
+            converged = all(p["converged"] for p in points)
+            steps = sum(p["steps"] for p in points)
+        elif route_kind == "TS":
             converged, steps, E_h = _ts_optimize_atoms_inplace(
                 a, maxcycles=maxcycles, sella=sella
             )
@@ -905,7 +958,16 @@ def run_conformer_workflow(
     # -----------------------
     # PHASE 4: IRC (serial; ORIGINAL ORDER)
     # -----------------------
-    if irc:
+    if irc and route_kind == "SCAN":
+        # The gate below only fires when frequencies actually ran. A scan endpoint
+        # is a constrained geometry, so it is not a saddle whether or not anyone
+        # asked for frequencies, and an IRC from it is meaningless.
+        LOG.warning(
+            "PHASE 4: IRC skipped — a scan endpoint is a constrained geometry, not "
+            "a saddle. Optimize scan/*_scan_max.xyz with --optts first, then run "
+            "--irc on that."
+        )
+    elif irc:
         irc_dir = os.path.join(out_dir, "irc")
         _ensure_dir(irc_dir)
         LOG.info("PHASE 4: IRC (serial) …")

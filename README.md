@@ -103,6 +103,10 @@ umadriver molecule.xyz --sp
 # Transition-state optimization, then freq and IRC
 umadriver ts_guess.xyz --optts --freq --irc
 
+# Relaxed scan of the atom 1 - atom 2 distance, 1.4 -> 2.6 A in 13 points
+# (atoms numbered from 1). Feed scan/*_scan_max.xyz to --optts for a TS guess.
+umadriver mol.xyz --scan 1 2 1.4 2.6 13
+
 # Optimize in implicit water (ALPB correction on every force and energy)
 umadriver molecule.xyz --opt Sella --alpb water
 
@@ -161,6 +165,14 @@ thermochemistry summary (qRRHO on by default).
   - `--sp`: single-point only (no optimization).
   - `--optts`: optimize to a 1st-order saddle. Implies Sella; conflicts with `--sp`
     and with any other `--opt`.
+  - `--scan I J FROM TO STEPS`: relaxed scan of the distance between atoms `I` and
+    `J` from `FROM` to `TO` Å in `STEPS` points. **Atoms are numbered from 1.** At
+    each point the bond is held fixed and everything else is minimized, starting
+    from the previous relaxed geometry. Writes `scan/<tag>_scan.csv` (the profile),
+    `scan/<tag>_scan.xyz` (the path), and `scan/<tag>_scan_max.xyz` — the highest
+    point, which is the structure to hand to `--optts`. Conflicts with `--optts`
+    and `--sp`. In a manifest: `scan: {i: 1, j: 2, from: 1.4, to: 2.6, steps: 13}`
+    or `scan: [1, 2, 1.4, 2.6, 13]`.
   - `--opt-mode {Loose,Normal,Tight,VeryTight}` *(default: Normal)*.
   - `--maxcycles INT` *(default: 300)*.
 - **Frequencies / Thermo**
@@ -492,6 +504,17 @@ See `LICENSE` in this repository.
 ## Changelog
 
 - **Unreleased**
+  - **Relaxed bond scans** — `--scan I J FROM TO STEPS`. Walks the distance between
+    two atoms, holding it fixed and minimizing everything else at each point, each
+    point starting from the previous relaxed geometry. **Atoms are numbered from 1.**
+    Emits the profile as CSV, the path as an XYZ trajectory, and the highest point
+    on its own as a TS guess for `--optts`. Every point records the distance it
+    actually reached, not the one requested, and warns when the two differ.
+    Note for anyone using ASE constraints elsewhere with this model: UMA returns
+    **float32** forces, and ASE's `FixBondLengths` enforces itself with a RATTLE
+    iteration to a hard-coded 1e-13 tolerance that float32 cannot reach — it
+    exhausts `maxiter` and raises on every force evaluation. `umadriver.scan`
+    ships a float64 subclass that fixes it without loosening any tolerance.
   - **`optts` and `optimizer` can no longer disagree.** `optts` selects a saddle
     search and always used Sella, so any other `optimizer` was silently ignored and
     `optimizer: null` was ignored too — meaning a job written to say "frequencies on

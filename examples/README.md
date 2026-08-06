@@ -12,6 +12,7 @@ root.
 | [`03_implicit_solvent.yaml`](03_implicit_solvent.yaml) | ALPB solvation with `--alpb`, and how to read `solv_corr_kcal`. |
 | [`04_phase1_optimize.yaml`](04_phase1_optimize.yaml) | Optimize a large batch across GPUs. |
 | [`05_phase2_frequencies.yaml`](05_phase2_frequencies.yaml) | Frequencies and solution-phase thermochemistry on the survivors. |
+| [`06_bond_scan.yaml`](06_bond_scan.yaml) | Relaxed scan along a bond, and turning its maximum into a TS guess. |
 
 ```bash
 umadriver --manifest examples/01_optimize_conformers.yaml --out-root runs

@@ -309,3 +309,33 @@ def test_freq_ts_defaults_to_letting_the_route_decide(monkeypatch):
     overrides = _run_cli(["mol.xyz", "--freq"], monkeypatch)
 
     assert overrides["freq_ts"] is None
+
+
+def test_scan_reaches_the_workflow_verbatim(monkeypatch):
+    """The CLI must hand the raw 5 values through; parse_scan_spec does the
+    1-based conversion once, in one place, for both CLI and manifests."""
+    overrides = _run_cli(["mol.xyz", "--scan", "1", "2", "0.9", "1.6", "8"], monkeypatch)
+
+    assert overrides["scan"] == ["1", "2", "0.9", "1.6", "8"]
+
+
+def test_scan_defaults_to_none(monkeypatch):
+    assert _run_cli(["mol.xyz", "--opt", "Sella"], monkeypatch)["scan"] is None
+
+
+def test_scan_and_optts_conflict(monkeypatch):
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--scan", "1", "2", "0.9", "1.6", "8", "--optts"], monkeypatch)
+
+
+def test_scan_and_sp_conflict(monkeypatch):
+    """A scan relaxes at every point, so --sp ("don't move it") cannot hold."""
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--scan", "1", "2", "0.9", "1.6", "8", "--sp"], monkeypatch)
+
+
+def test_a_bad_scan_spec_fails_before_the_batch_starts(monkeypatch):
+    """Atom 0 does not exist in 1-based numbering. Catching it at argv time beats
+    discovering it inside a worker after the model has loaded."""
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--scan", "0", "2", "0.9", "1.6", "8"], monkeypatch)
