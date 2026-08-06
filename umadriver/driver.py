@@ -61,7 +61,7 @@ from .utils import setup_logging, mode_type, optimizer_type, initialize_env
 from .constants import DEFAULT_FAIRCHEM_CACHE, VAST_BASE
 from .batch import BatchCommon, run_batch_from_manifest, run_batch_from_glob
 from .vib_thermo import FREE_VOLUME_SOLVENTS
-from .scan import parse_scan_spec
+from .scan import SCAN_MODES, parse_scan_spec
 from .solvation import ALPB_METHODS
 
 LOG = logging.getLogger("umadriver")
@@ -163,14 +163,27 @@ def main():
     p.add_argument("--maxcycles", type=int, default=300)
     p.add_argument(
         "--scan",
-        nargs=5,
-        metavar=("I", "J", "FROM", "TO", "STEPS"),
+        nargs="+",
+        action="append",
+        metavar="ATOMS... FROM TO STEPS",
         default=None,
-        help="Relaxed scan of the distance between atoms I and J, from FROM to TO "
-        "angstroms in STEPS points. Atoms are numbered from 1 (the first atom in "
-        "the file is 1). At each point the bond is held fixed and everything else "
-        "is minimized. Writes scan/<tag>_scan.csv, the path as an XYZ trajectory, "
-        "and the highest point on its own as a TS guess for --optts.",
+        help="Relaxed scan of an internal coordinate. The number of values picks "
+        "the coordinate: `I J FROM TO STEPS` is a distance (angstroms), "
+        "`I J K FROM TO STEPS` an angle and `I J K L FROM TO STEPS` a dihedral "
+        "(both degrees). Atoms are numbered from 1. Repeat --scan for several "
+        "coordinates, and see --scan-mode for how they combine. At each point the "
+        "scanned coordinates are held fixed and everything else is minimized. "
+        "Writes scan/<tag>_scan.csv, the path as an XYZ trajectory, and the "
+        "highest point on its own as a TS guess for --optts.",
+    )
+    p.add_argument(
+        "--scan-mode",
+        choices=list(SCAN_MODES),
+        default="sequential",
+        help="How several --scan coordinates combine. 'sequential' (default) "
+        "scans them one after another, each starting where the last finished "
+        "(sum of the step counts). 'concerted' advances them all together along "
+        "one path, so they must share a step count (that many points).",
     )
 
     p.add_argument("--sella-internal", dest="sella_internal", action="store_true")
@@ -298,9 +311,12 @@ def main():
         # Fail here, on one structure's worth of argv, rather than inside a worker
         # once the batch is already running.
         try:
+            args.scan = {"mode": args.scan_mode, "coords": args.scan}
             parse_scan_spec(args.scan)
         except ValueError as e:
             p.error(str(e))
+    elif args.scan_mode != "sequential":
+        p.error("--scan-mode has no effect without --scan")
 
     setup_logging(verbose=args.verbose, debug=args.debug)
     # Sets HF_HUB_OFFLINE=1 when the model cache is already populated, so a healthy

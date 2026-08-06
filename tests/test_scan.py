@@ -1,13 +1,13 @@
-"""Relaxed bond scans.
+"""Relaxed scans over internal coordinates.
 
 Two layers, as elsewhere in this suite:
 
-1. Parsing and the scan mechanics, with no model. ``run_bond_scan`` takes its
-   minimizer as an argument, so a plain ASE optimizer on EMT exercises the whole
-   loop — the displacement schedule, the constraint handling, the chaining and the
+1. Parsing and the scan mechanics, with no model. ``run_scan`` takes its minimizer
+   as an argument, so a plain ASE optimizer on EMT exercises the whole loop — the
+   schedule, the constraint handling, the fragment moves, the chaining and the
    output files — in a second.
-2. The real thing on water with UMA, which is the only way to check that a scan
-   through a bond produces a physically sensible profile.
+2. The real thing with UMA, which is the only way to check that a scan through a
+   coordinate produces a physically sensible profile.
 """
 
 from __future__ import annotations
@@ -23,53 +23,197 @@ from ase.constraints import FixAtoms
 from ase.io import read as ase_read
 from ase.optimize import LBFGS
 
-from umadriver.scan import ScanSpec, parse_scan_spec, run_bond_scan
+from umadriver.scan import parse_scan_spec, run_scan
 
 
 # ---------------------------------------------------------------- parsing
 def test_atoms_are_one_based():
-    """The user-facing convention. Getting this wrong scans a different bond and
-    every number downstream still looks reasonable, so it is pinned explicitly."""
-    spec = parse_scan_spec([1, 2, 0.9, 1.6, 8])
+    """The user-facing convention, matching xtb and Gaussian. Getting this wrong
+    scans a different coordinate and every number downstream still looks
+    reasonable, so it is pinned explicitly."""
+    (coord,) = parse_scan_spec([1, 2, 0.9, 1.6, 8]).coords
 
-    assert (spec.i, spec.j) == (0, 1), "should convert to ASE's 0-based indexing"
-    assert (spec.i1, spec.j1) == (1, 2), "should report back in the user's numbering"
+    assert coord.indices == (0, 1), "should convert to ASE's 0-based indexing"
+    assert coord.atoms1 == (1, 2), "should report back in the user's numbering"
+
+
+@pytest.mark.parametrize(
+    "values,kind,natoms",
+    [
+        ([1, 2, 0.9, 1.6, 8], "distance", 2),
+        ([2, 1, 3, 100.0, 140.0, 8], "angle", 3),
+        ([8, 5, 1, 4, 60.0, 420.0, 8], "dihedral", 8 and 4),
+    ],
+)
+def test_the_value_count_picks_the_coordinate(values, kind, natoms):
+    """5/6/7 values is what lets one --scan flag take all three coordinate types."""
+    (coord,) = parse_scan_spec(values).coords
+
+    assert coord.kind == kind
+    assert len(coord.indices) == natoms
 
 
 def test_mapping_and_sequence_forms_agree():
     seq = parse_scan_spec([3, 7, 2.8, 1.4, 15])
-    mapping = parse_scan_spec({"i": 3, "j": 7, "from": 2.8, "to": 1.4, "steps": 15})
+    mapping = parse_scan_spec({"distance": [3, 7], "from": 2.8, "to": 1.4, "steps": 15})
 
     assert seq == mapping
 
 
-def test_targets_span_the_requested_range():
-    spec = parse_scan_spec([1, 2, 1.0, 2.0, 5])
+def test_coordinate_aliases():
+    """`bond` and `torsion` are what people type; failing on them would be rude."""
+    assert parse_scan_spec({"bond": [1, 2], "from": 1.0, "to": 2.0, "steps": 3}) == (
+        parse_scan_spec({"distance": [1, 2], "from": 1.0, "to": 2.0, "steps": 3})
+    )
+    assert parse_scan_spec(
+        {"torsion": [1, 2, 3, 4], "from": 0, "to": 90, "steps": 3}
+    ) == parse_scan_spec(
+        {"dihedral": [1, 2, 3, 4], "from": 0, "to": 90, "steps": 3}
+    )
 
-    np.testing.assert_allclose(spec.targets, [1.0, 1.25, 1.5, 1.75, 2.0])
-    assert spec.step_A == pytest.approx(0.25)
+
+def test_units_and_labels():
+    spec = parse_scan_spec([[1, 2, 1.0, 2.0, 3], [2, 1, 3, 100, 120, 3]])
+    d, a = spec.coords
+
+    assert (d.unit, a.unit) == ("A", "deg")
+    assert (d.label, a.label) == ("d_1_2", "a_2_1_3")
+
+
+def test_targets_span_the_requested_range():
+    (coord,) = parse_scan_spec([1, 2, 1.0, 2.0, 5]).coords
+
+    np.testing.assert_allclose(coord.targets, [1.0, 1.25, 1.5, 1.75, 2.0])
+    assert coord.step == pytest.approx(0.25)
 
 
 def test_a_decreasing_range_is_allowed():
     """Scanning inward (association) is as valid as scanning outward."""
-    spec = parse_scan_spec([1, 2, 3.0, 1.4, 5])
+    (coord,) = parse_scan_spec([1, 2, 3.0, 1.4, 5]).coords
 
-    assert spec.targets[0] > spec.targets[-1]
-    assert spec.step_A == pytest.approx(0.4)
+    assert coord.targets[0] > coord.targets[-1]
+    assert coord.step == pytest.approx(0.4)
+
+
+# ------------------------------------------------- combining several coords
+def test_sequential_scans_one_coordinate_at_a_time():
+    """xtb's default: finish coordinate 1, then walk coordinate 2 from where it
+    left off, with coordinate 1 held at its end value."""
+    spec = parse_scan_spec([[1, 2, 1.0, 2.0, 3], [2, 1, 3, 100, 120, 3]])
+
+    assert spec.mode == "sequential"
+    assert spec.schedule() == [
+        (1.0, 100.0),
+        (1.5, 100.0),
+        (2.0, 100.0),
+        (2.0, 110.0),
+        (2.0, 120.0),
+    ]
+
+
+def test_the_sequential_handover_is_not_computed_twice():
+    """The last point of coordinate 1 and the first of coordinate 2 are the same
+    geometry. Without dedup, every extra coordinate costs one wasted
+    optimization — 3 + 3 points would run 6 rather than 5."""
+    spec = parse_scan_spec([[1, 2, 1.0, 2.0, 3], [2, 1, 3, 100, 120, 3]])
+
+    assert spec.npoints == 5
+    assert len(set(spec.schedule())) == 5
+
+
+def test_concerted_advances_everything_together():
+    spec = parse_scan_spec(
+        {"mode": "concerted", "coords": [[1, 2, 1.0, 2.0, 3], [2, 1, 3, 100, 120, 3]]}
+    )
+
+    assert spec.npoints == 3, "one path, not a grid"
+    assert spec.schedule() == [(1.0, 100.0), (1.5, 110.0), (2.0, 120.0)]
+
+
+def test_concerted_requires_matching_step_counts():
+    with pytest.raises(ValueError, match="same number of points"):
+        parse_scan_spec(
+            {
+                "mode": "concerted",
+                "coords": [[1, 2, 1.0, 2.0, 3], [2, 1, 3, 100, 120, 5]],
+            }
+        )
+
+
+def test_grid_covers_every_combination_exactly_once():
+    spec = parse_scan_spec(
+        {"mode": "grid", "coords": [[1, 2, 1.0, 1.4, 3], [1, 3, 2.0, 2.4, 3]]}
+    )
+    points = spec.schedule()
+
+    assert spec.npoints == 9
+    assert len(set(points)) == 9
+    assert set(points) == {
+        (a, b) for a in (1.0, 1.2, 1.4) for b in (2.0, 2.2, 2.4)
+    }
+
+
+def test_grid_is_walked_without_jumping():
+    """Boustrophedon order: each row traversed opposite to the last, so every
+    step is to a neighbouring grid point. A plain row-major sweep would jump the
+    inner coordinate across its whole range at every row break — discarding the
+    starting guess exactly where the geometry has drifted furthest."""
+    spec = parse_scan_spec(
+        {"mode": "grid", "coords": [[1, 2, 1.0, 1.4, 3], [1, 3, 2.0, 2.4, 3]]}
+    )
+    points = spec.schedule()
+
+    for prev, curr in zip(points, points[1:]):
+        changed = [i for i in (0, 1) if abs(curr[i] - prev[i]) > 1e-12]
+        assert len(changed) == 1, f"{prev} -> {curr} moved both coordinates"
+        assert abs(curr[changed[0]] - prev[changed[0]]) == pytest.approx(0.2), (
+            f"{prev} -> {curr} is not a single step"
+        )
+
+
+@pytest.mark.parametrize("ncoords", [1, 3])
+def test_grid_takes_exactly_two_coordinates(ncoords):
+    """A third coordinate turns 12x12 into 1728 optimizations."""
+    coords = [[1, i + 2, 1.0, 1.4, 3] for i in range(ncoords)]
+    with pytest.raises(ValueError, match="exactly 2 coordinates"):
+        parse_scan_spec({"mode": "grid", "coords": coords})
+
+
+def test_grid_allows_different_step_counts():
+    """Unlike concerted, the two axes are independent."""
+    spec = parse_scan_spec(
+        {"mode": "grid", "coords": [[1, 2, 1.0, 1.4, 3], [1, 3, 2.0, 2.4, 4]]}
+    )
+
+    assert spec.npoints == 12
+
+
+def test_a_single_coordinate_is_the_same_either_way():
+    seq = parse_scan_spec({"mode": "sequential", "coords": [[1, 2, 1.0, 2.0, 4]]})
+    con = parse_scan_spec({"mode": "concerted", "coords": [[1, 2, 1.0, 2.0, 4]]})
+
+    assert seq.schedule() == con.schedule()
 
 
 @pytest.mark.parametrize(
     "value,message",
     [
         ([0, 2, 0.9, 1.6, 8], "numbered from 1"),
-        ([1, 1, 0.9, 1.6, 8], "must differ"),
+        ([1, 1, 0.9, 1.6, 8], "distinct atoms"),
         ([1, 2, 0.9, 1.6, 1], "at least 2 points"),
         ([1, 2, 1.5, 1.5, 8], "nothing to scan"),
         ([1, 2, -0.9, 1.6, 8], "must be positive"),
-        ([1, 2, "x", 1.6, 8], "two atom numbers"),
-        ([1, 2, 0.9, 1.6], "5 values"),
-        ({"i": 1, "j": 2, "from": 0.9, "to": 1.6}, "missing"),
-        ({"i": 1, "j": 2, "from": 0.9, "to": 1.6, "steps": 8, "nope": 1}, "unknown"),
+        ([1, 2, "x", 1.6, 8], "atom numbers"),
+        ([1, 2, 0.9, 1.6], "5, 6 or 7 values"),
+        ([1, 2, 3, 4, 5, 0.9, 1.6, 8], "5, 6 or 7 values"),
+        ({"distance": [1, 2], "from": 0.9, "to": 1.6}, "missing"),
+        ({"distance": [1, 2], "from": 0.9, "to": 1.6, "steps": 8, "no": 1}, "unknown"),
+        ({"distance": 1, "from": 0.9, "to": 1.6, "steps": 8}, "list of atom numbers"),
+        ({"from": 0.9, "to": 1.6, "steps": 8}, "exactly one of"),
+        ({"mode": "diagonal", "coords": [[1, 2, 1.0, 2.0, 3]]}, "mode must be one of"),
+        ({"mode": "concerted"}, "without `coords`"),
+        ([[1, 2, 1.0, 2.0, 3], [1, 2, 1.0, 2.0, 3]], "more than once"),
+        ([], "no coordinates"),
     ],
 )
 def test_bad_specs_are_rejected(value, message):
@@ -82,8 +226,8 @@ def test_out_of_range_atom_is_caught_against_the_structure(tmp_path):
     atoms = molecule("H2O")
     atoms.calc = EMT()
 
-    with pytest.raises(ValueError, match="numbered 1..3"):
-        run_bond_scan(
+    with pytest.raises(ValueError, match=r"numbered 1\.\.3"):
+        run_scan(
             atoms,
             parse_scan_spec([1, 4, 0.9, 1.2, 3]),
             relax=lambda a: (True, 0, 0.0),
@@ -94,63 +238,104 @@ def test_out_of_range_atom_is_caught_against_the_structure(tmp_path):
 
 # ---------------------------------------------------------------- mechanics
 def _lbfgs_relax(atoms):
-    """Stand-in for the workflow's minimizer. LBFGS honours FixBondLength to
-    ~1e-13 A, so any drift the scan reports is the scan's own doing."""
-    opt = LBFGS(atoms, logfile=None)
-    opt.run(fmax=0.05, steps=50)
+    """Stand-in for the workflow's minimizer."""
+    LBFGS(atoms, logfile=None).run(fmax=0.05, steps=50)
     return True, 12, float(atoms.get_potential_energy())
 
 
 def _scan(tmp_path, spec_values=(1, 2, 1.0, 1.6, 7), name="C2H6", **kw):
     atoms = molecule(name)
     atoms.calc = EMT()
-    records = run_bond_scan(
+    spec = parse_scan_spec(spec_values)
+    records = run_scan(
         atoms,
-        parse_scan_spec(list(spec_values)),
+        spec,
         relax=kw.pop("relax", _lbfgs_relax),
         out_dir=str(tmp_path / "scan"),
         tag="conf_0000",
         **kw,
     )
-    return atoms, records
+    return atoms, records, spec
 
 
-def test_every_point_lands_on_its_target(tmp_path):
-    _, records = _scan(tmp_path)
+@pytest.mark.parametrize(
+    "values,tol",
+    [
+        ((1, 2, 1.0, 1.6, 5), 1e-6),
+        ((3, 1, 2, 100.0, 125.0, 5), 1e-4),
+        ((3, 1, 2, 6, 60.0, 200.0, 5), 1e-3),
+    ],
+    ids=["distance", "angle", "dihedral"],
+)
+def test_every_point_lands_on_its_target(tmp_path, values, tol):
+    """All three coordinate types, held to their requested value."""
+    _, records, spec = _scan(tmp_path, values)
+    (coord,) = spec.coords
 
-    assert len(records) == 7
+    assert len(records) == 5
     for r in records:
-        assert r["actual_A"] == pytest.approx(r["target_A"], abs=1e-6), (
-            f"point {r['point']} asked for {r['target_A']:.4f} A and got "
-            f"{r['actual_A']:.4f} A"
+        target = r[f"{coord.label}_target"]
+        actual = r[f"{coord.label}_actual"]
+        assert actual == pytest.approx(target, abs=tol), (
+            f"point {r['point']} asked for {target:.4f} {coord.unit} and got "
+            f"{actual:.4f} {coord.unit}"
         )
 
 
-def test_the_scan_relaxes_rather_than_just_stretching(tmp_path):
-    """A scan that only moved the two atoms and skipped the minimization would
-    still hit every target — so check the rest of the molecule actually moved."""
-    seen = {}
+def test_a_concerted_scan_holds_both_coordinates_at_once(tmp_path):
+    _, records, spec = _scan(
+        tmp_path,
+        {"mode": "concerted", "coords": [[1, 2, 1.5, 1.7, 4], [3, 1, 2, 108, 118, 4]]},
+    )
+
+    assert len(records) == 4
+    d, a = spec.coords
+    for r in records:
+        assert r[f"{d.label}_actual"] == pytest.approx(r[f"{d.label}_target"], abs=1e-5)
+        assert r[f"{a.label}_actual"] == pytest.approx(r[f"{a.label}_target"], abs=1e-3)
+
+
+def test_a_grid_runs_every_point(tmp_path):
+    _, records, spec = _scan(
+        tmp_path,
+        {"mode": "grid", "coords": [[1, 2, 1.4, 1.6, 3], [1, 3, 1.05, 1.15, 3]]},
+    )
+    a, b = spec.coords
+
+    assert len(records) == 9
+    seen = {
+        (round(r[f"{a.label}_target"], 6), round(r[f"{b.label}_target"], 6))
+        for r in records
+    }
+    assert len(seen) == 9, "a grid point was visited twice or skipped"
+    for r in records:
+        assert r[f"{a.label}_actual"] == pytest.approx(r[f"{a.label}_target"], abs=1e-5)
+        assert r[f"{b.label}_actual"] == pytest.approx(r[f"{b.label}_target"], abs=1e-5)
+
+
+def test_the_scan_relaxes_rather_than_just_distorting(tmp_path):
+    """A scan that skipped the minimization would still hit every target — so
+    check the rest of the molecule actually moved."""
+    moved = []
 
     def relax(atoms):
         before = atoms.get_positions().copy()
         out = _lbfgs_relax(atoms)
-        seen.setdefault("moved", []).append(
-            float(np.abs(atoms.get_positions() - before).max())
-        )
+        moved.append(float(np.abs(atoms.get_positions() - before).max()))
         return out
 
     _scan(tmp_path, relax=relax)
 
-    assert max(seen["moved"]) > 0.01, "no relaxation happened between points"
+    assert max(moved) > 0.01, "no relaxation happened between points"
 
 
-def test_the_bond_is_constrained_while_relaxing(tmp_path):
-    """The whole point: `relax` must be handed atoms that cannot change the bond.
-    Without the constraint this is an ordinary optimization from a stretched
-    start, and every point collapses to the same minimum.
+def test_the_coordinate_is_constrained_while_relaxing(tmp_path):
+    """The whole point: `relax` must be handed atoms that cannot change the
+    coordinate. Without the constraint this is an ordinary optimization from a
+    distorted start, and every point collapses to the same minimum.
 
     Asserted by effect rather than by constraint class: what matters is that a
-    full minimization cannot move the bond, not which ASE object arranges that.
+    full minimization cannot move it, not which ASE object arranges that.
     """
     held = []
 
@@ -164,12 +349,42 @@ def test_the_bond_is_constrained_while_relaxing(tmp_path):
 
     assert held, "relax was never called"
     for before, after in held:
-        assert after == pytest.approx(before, abs=1e-9), (
+        assert after == pytest.approx(before, abs=1e-6), (
             f"minimization moved the constrained bond {before:.4f} -> {after:.4f} A"
         )
-    # ...and the points really were at different distances, so the check is not
-    # vacuously satisfied by nothing ever moving.
+    # ...and the points really were at different values, so this is not vacuously
+    # satisfied by nothing ever moving.
     assert len({round(b, 3) for b, _ in held}) == len(held)
+
+
+def test_a_dihedral_rotates_a_whole_group(tmp_path):
+    """ASE's set_dihedral moves only the fourth atom unless told otherwise, which
+    tears a methyl off instead of rotating it. The scan works out the fragment on
+    the far side of the central bond and moves all of it."""
+    seen = {}
+
+    def relax(atoms):
+        if "first" not in seen:
+            seen["first"] = atoms.get_positions().copy()
+        return True, 0, float(atoms.get_potential_energy())
+
+    atoms = molecule("C2H6")
+    atoms.calc = EMT()
+    start = atoms.get_positions().copy()
+    run_scan(
+        atoms,
+        parse_scan_spec([3, 1, 2, 6, 60.0, 120.0, 3]),
+        relax=relax,
+        out_dir=str(tmp_path / "scan"),
+        tag="conf_0000",
+    )
+
+    # atoms 5,6,7 (0-based) are the three H on the rotating carbon: all should move
+    moved = np.abs(seen["first"] - start).max(axis=1) > 1e-6
+    assert moved[[5, 6, 7]].all(), (
+        "only part of the rotating group moved — the molecule was distorted, not "
+        f"rotated (moved: {np.where(moved)[0].tolist()})"
+    )
 
 
 def test_each_point_continues_from_the_previous_one(tmp_path):
@@ -181,12 +396,12 @@ def test_each_point_continues_from_the_previous_one(tmp_path):
         starts.append(atoms.get_positions().copy())
         return _lbfgs_relax(atoms)
 
-    _scan(tmp_path, spec_values=(1, 2, 1.5, 1.7, 5), relax=relax)
+    _scan(tmp_path, (1, 2, 1.5, 1.7, 5), relax=relax)
 
-    # Ignore the two scanned atoms: set_distance moves those by construction.
     for prev, curr in zip(starts, starts[1:]):
-        rest = np.abs(curr - prev)[2:]
-        assert rest.max() < 0.2, "point did not start from the previous geometry"
+        assert np.abs(curr - prev).max() < 0.3, (
+            "point did not start from the previous geometry"
+        )
 
 
 def test_original_constraints_are_restored(tmp_path):
@@ -194,7 +409,7 @@ def test_original_constraints_are_restored(tmp_path):
     atoms.calc = EMT()
     atoms.set_constraint(FixAtoms(indices=[0]))
 
-    run_bond_scan(
+    run_scan(
         atoms,
         parse_scan_spec([1, 2, 1.5, 1.6, 3]),
         relax=_lbfgs_relax,
@@ -206,84 +421,108 @@ def test_original_constraints_are_restored(tmp_path):
 
 
 def test_atoms_are_left_at_the_final_point(tmp_path):
-    atoms, records = _scan(tmp_path)
+    atoms, records, spec = _scan(tmp_path)
+    (coord,) = spec.coords
 
-    assert atoms.get_distance(0, 1) == pytest.approx(records[-1]["actual_A"], abs=1e-9)
+    assert atoms.get_distance(0, 1) == pytest.approx(
+        records[-1][f"{coord.label}_actual"], abs=1e-9
+    )
 
 
-def test_constraint_survives_float32_forces():
-    """UMA returns float32 forces. ASE's stock FixBondLength runs a RATTLE
-    iteration to a hard-coded 1e-13 tolerance, which float32 can never reach — it
-    exhausts maxiter and raises on *every* force evaluation, so a scan dies on its
-    first optimizer step. EMT returns float64 and hides this completely.
+def test_the_constraint_survives_float32_forces():
+    """UMA returns float32 forces, and that is not a detail.
+
+    ASE's FixBondLengths — the obvious choice for a bond scan — enforces itself
+    with a RATTLE iteration to a hard-coded 1e-13 tolerance, which float32 can
+    never reach: it exhausts maxiter and raises on *every* force evaluation, so a
+    scan dies on its first optimizer step. EMT returns float64 and hides this
+    completely. FixInternals iterates to 1e-7 instead and is fine, which is why
+    the scan uses it for distances as well as angles and dihedrals.
     """
     from ase.constraints import FixBondLengths
 
-    from umadriver.scan import fix_bond_length
+    from umadriver.scan import _constraint
 
-    atoms = molecule("H2O")
-    atoms.calc = EMT()
-    f32 = np.asarray(atoms.get_forces(), dtype=np.float32)
-
+    # The trap, demonstrated. Whether it bites depends on the system — H2O and
+    # CH4 do, C2H6 does not — which is exactly what makes it dangerous: it can
+    # pass a smoke test and then kill a real run.
+    water = molecule("H2O")
+    water.calc = EMT()
     with pytest.raises(RuntimeError, match="Did not converge"):
-        FixBondLengths([(0, 1)]).adjust_forces(atoms, f32.copy())
+        FixBondLengths([(0, 1)]).adjust_forces(
+            water, np.asarray(water.get_forces(), dtype=np.float32)
+        )
 
-    ours = f32.copy()
-    fix_bond_length(0, 1).adjust_forces(atoms, ours)  # must not raise
-
-    assert ours.dtype == np.float32, "must write back in the caller's dtype"
-    # and it actually did something: the component along the bond is projected out
-    assert not np.allclose(ours, f32)
-
-
-def test_float64_forces_still_take_the_normal_path():
-    from umadriver.scan import fix_bond_length
-
-    atoms = molecule("H2O")
+    atoms = molecule("C2H6")
     atoms.calc = EMT()
     f64 = atoms.get_forces()
+    f32 = np.asarray(f64, dtype=np.float32)
 
-    ours, stock = f64.copy(), f64.copy()
-    fix_bond_length(0, 1).adjust_forces(atoms, ours)
-    from ase.constraints import FixBondLengths
+    # what the scan actually builds, over all three coordinate types
+    spec = parse_scan_spec(
+        [
+            [1, 2, 1.5, 1.6, 2],
+            [3, 1, 2, 108.0, 110.0, 2],
+            [3, 1, 2, 6, 60.0, 70.0, 2],
+        ]
+    )
+    values = (
+        atoms.get_distance(0, 1),
+        atoms.get_angle(2, 0, 1),
+        atoms.get_dihedral(2, 0, 1, 5),
+    )
 
-    FixBondLengths([(0, 1)]).adjust_forces(atoms, stock)
+    g32 = f32.copy()
+    _constraint(spec, values).adjust_forces(atoms, g32)  # must not raise
+    g64 = f64.copy()
+    _constraint(spec, values).adjust_forces(atoms, g64)
 
-    np.testing.assert_allclose(ours, stock, atol=0)
+    assert g32.dtype == np.float32, "must write back in the caller's dtype"
+    # and float32 gives the right answer, not merely a non-crashing one
+    assert np.abs(g32 - g64).max() < 1e-6
 
 
 # ---------------------------------------------------------------- outputs
-def test_csv_has_one_row_per_point(tmp_path):
-    _, records = _scan(tmp_path)
+def test_csv_has_a_column_pair_per_coordinate(tmp_path):
+    _, records, spec = _scan(
+        tmp_path, [[1, 2, 1.0, 1.6, 3], [3, 1, 2, 100.0, 120.0, 3]]
+    )
 
     with open(tmp_path / "scan" / "conf_0000_scan.csv") as f:
         rows = list(csv.DictReader(f))
 
-    assert len(rows) == len(records)
-    assert float(rows[0]["target_A"]) == pytest.approx(1.0)
-    assert float(rows[-1]["target_A"]) == pytest.approx(1.6)
+    assert len(rows) == len(records) == 5  # 3 + 3, minus the shared handover
+    for coord in spec.coords:
+        assert f"{coord.label}_target" in rows[0]
+        assert f"{coord.label}_actual" in rows[0]
     # rel_kcal is measured from the lowest point, so some point must be 0
     assert min(abs(float(r["rel_kcal"])) for r in rows) == pytest.approx(0.0, abs=1e-9)
 
 
 def test_trajectory_carries_every_frame(tmp_path):
-    _, records = _scan(tmp_path)
+    _, records, spec = _scan(tmp_path)
+    (coord,) = spec.coords
 
     frames = ase_read(str(tmp_path / "scan" / "conf_0000_scan.xyz"), index=":")
 
     assert len(frames) == len(records)
     for frame, r in zip(frames, records):
-        assert frame.get_distance(0, 1) == pytest.approx(r["actual_A"], abs=1e-6)
+        assert frame.get_distance(0, 1) == pytest.approx(
+            r[f"{coord.label}_actual"], abs=1e-6
+        )
 
 
 def test_max_file_is_the_highest_point(tmp_path):
     """It is the TS guess users feed to --optts, so it has to be the right frame."""
-    _, records = _scan(tmp_path)
+    _, records, spec = _scan(tmp_path)
+    (coord,) = spec.coords
 
     top = max(records, key=lambda r: r["energy_Eh"])
     guess = ase_read(str(tmp_path / "scan" / "conf_0000_scan_max.xyz"))
 
-    assert guess.get_distance(0, 1) == pytest.approx(top["actual_A"], abs=1e-6)
+    assert guess.get_distance(0, 1) == pytest.approx(
+        top[f"{coord.label}_actual"], abs=1e-6
+    )
 
 
 def test_unconverged_points_are_reported_not_hidden(tmp_path, caplog):
@@ -296,7 +535,9 @@ def test_unconverged_points_are_reported_not_hidden(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------- with UMA
-def test_water_bond_scan_has_a_minimum_in_the_middle(tmp_path, h2o_xyz, uma_calc, energies):
+def test_water_bond_scan_has_a_minimum_in_the_middle(
+    tmp_path, h2o_xyz, uma_calc, energies
+):
     """The physics check. Stretching or squeezing an O-H bond away from
     equilibrium must cost energy, so a scan straddling ~0.96 A dips in the middle.
     """
@@ -317,12 +558,12 @@ def test_water_bond_scan_has_a_minimum_in_the_middle(tmp_path, h2o_xyz, uma_calc
 
     assert len(rows) == 9
     for r in rows:
-        assert float(r["actual_A"]) == pytest.approx(float(r["target_A"]), abs=1e-3)
+        assert float(r["d_1_2_actual"]) == pytest.approx(float(r["d_1_2_target"]), abs=1e-3)
 
     e = [float(r["energy_Eh"]) for r in rows]
     lowest = int(np.argmin(e))
     assert 0 < lowest < 8, f"minimum landed at the edge (point {lowest}) of the scan"
-    r_min = float(rows[lowest]["actual_A"])
+    r_min = float(rows[lowest]["d_1_2_actual"])
     assert 0.9 < r_min < 1.05, f"O-H equilibrium looks wrong: {r_min:.3f} A"
 
     row = energies(csv_path)[0]
@@ -331,10 +572,119 @@ def test_water_bond_scan_has_a_minimum_in_the_middle(tmp_path, h2o_xyz, uma_calc
     assert float(row["energy_Eh"]) == pytest.approx(e[-1], abs=1e-10)
 
 
-def test_scan_max_can_be_reoptimized_as_a_ts(tmp_path, h2o_xyz, uma_calc):
-    """The advertised workflow: scan, then hand the maximum to --optts. This only
-    checks the handoff — that the file exists, is readable, and is a structure the
-    workflow accepts — not that water has a TS."""
+def test_water_angle_scan_has_a_minimum_in_the_middle(tmp_path, h2o_xyz, uma_calc):
+    """Angles go through the same machinery as distances but a different ASE call,
+    so the physics is worth checking independently. Water bends at ~104.5 deg."""
+    from umadriver.ensemble import run_conformer_workflow
+
+    out = str(tmp_path / "angle")
+    run_conformer_workflow(
+        h2o_xyz,
+        out_dir=out,
+        scan={"angle": [2, 1, 3], "from": 85.0, "to": 125.0, "steps": 9},
+        maxcycles=200,
+        calc=uma_calc,
+    )
+
+    with open(os.path.join(out, "scan", "conf_0000_scan.csv")) as f:
+        rows = list(csv.DictReader(f))
+
+    for r in rows:
+        assert float(r["a_2_1_3_actual"]) == pytest.approx(
+            float(r["a_2_1_3_target"]), abs=1e-1
+        )
+
+    e = [float(r["energy_Eh"]) for r in rows]
+    best = float(rows[int(np.argmin(e))]["a_2_1_3_actual"])
+    assert 95.0 < best < 115.0, f"H-O-H equilibrium angle looks wrong: {best:.1f} deg"
+
+
+def test_a_two_coordinate_scan_runs_end_to_end(tmp_path, h2o_xyz, uma_calc, energies):
+    """Distance and angle together, sequentially — the multi-coordinate path
+    through the real workflow."""
+    from umadriver.ensemble import run_conformer_workflow
+
+    out = str(tmp_path / "multi")
+    csv_path = run_conformer_workflow(
+        h2o_xyz,
+        out_dir=out,
+        scan={
+            "coords": [
+                {"distance": [1, 2], "from": 0.95, "to": 1.15, "steps": 3},
+                {"angle": [2, 1, 3], "from": 100.0, "to": 115.0, "steps": 3},
+            ]
+        },
+        maxcycles=200,
+        calc=uma_calc,
+    )
+
+    with open(os.path.join(out, "scan", "conf_0000_scan.csv")) as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 5, "3 + 3 points sharing one handover geometry"
+    # coordinate 1 is held at its end value while coordinate 2 is scanned
+    for r in rows[2:]:
+        assert float(r["d_1_2_actual"]) == pytest.approx(1.15, abs=1e-3)
+    assert float(rows[-1]["a_2_1_3_actual"]) == pytest.approx(115.0, abs=1e-1)
+    assert energies(csv_path)[0]["route"] == "SCAN"
+
+
+def test_water_two_bond_grid_is_symmetric(tmp_path, h2o_xyz, uma_calc, energies):
+    """A 3x3 grid over both O-H bonds — the full-surface mode.
+
+    Water's two O-H bonds are equivalent, so E(r1, r2) must equal E(r2, r1). That
+    symmetry is a much stronger check than "the numbers look plausible": it would
+    break if the grid mislabelled its axes, applied a constraint to the wrong
+    atoms, or let one coordinate drift while the other was being scanned.
+    """
+    from umadriver.ensemble import run_conformer_workflow
+
+    out = str(tmp_path / "grid")
+    csv_path = run_conformer_workflow(
+        h2o_xyz,
+        out_dir=out,
+        scan={
+            "mode": "grid",
+            "coords": [
+                {"distance": [1, 2], "from": 0.90, "to": 1.10, "steps": 3},
+                {"distance": [1, 3], "from": 0.90, "to": 1.10, "steps": 3},
+            ],
+        },
+        maxcycles=200,
+        calc=uma_calc,
+    )
+
+    with open(os.path.join(out, "scan", "conf_0000_scan.csv")) as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 9, "3 x 3 grid"
+
+    surface = {
+        (round(float(r["d_1_2_actual"]), 3), round(float(r["d_1_3_actual"]), 3)): float(
+            r["energy_Eh"]
+        )
+        for r in rows
+    }
+    assert len(surface) == 9
+
+    for (r1, r2), e in surface.items():
+        mirrored = surface.get((r2, r1))
+        assert mirrored is not None, f"grid is not square at ({r1}, {r2})"
+        assert e == pytest.approx(mirrored, abs=1e-5), (
+            f"E({r1}, {r2}) = {e:.6f} but E({r2}, {r1}) = {mirrored:.6f}; water's "
+            "two O-H bonds are equivalent so the surface must be symmetric"
+        )
+
+    # The grid samples 0.90/1.00/1.10 A, and 1.00 is the value nearest water's
+    # ~0.96 A equilibrium, so the surface bottoms out in the middle — away from
+    # every edge, which is what makes this a real minimum rather than a corner.
+    best = min(surface, key=surface.get)
+    assert best == (1.0, 1.0), f"minimum of the grid landed at {best}"
+    assert energies(csv_path)[0]["route"] == "SCAN"
+
+
+def test_scan_max_is_written_for_reoptimization(tmp_path, h2o_xyz, uma_calc):
+    """The advertised workflow: scan, then hand the maximum to --optts."""
     from umadriver.ensemble import run_conformer_workflow
 
     out = str(tmp_path / "scan")

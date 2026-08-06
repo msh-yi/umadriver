@@ -107,6 +107,16 @@ umadriver ts_guess.xyz --optts --freq --irc
 # (atoms numbered from 1). Feed scan/*_scan_max.xyz to --optts for a TS guess.
 umadriver mol.xyz --scan 1 2 1.4 2.6 13
 
+# 6 values is an angle, 7 a dihedral (degrees)
+umadriver mol.xyz --scan 2 1 3 100 140 9
+umadriver mol.xyz --scan 8 5 1 4 60 420 37
+
+# A bond breaking as an angle opens: both move together along one path
+umadriver mol.xyz --scan 1 2 1.4 2.6 13 --scan 2 1 3 104 130 13 --scan-mode concerted
+
+# A full 2D surface over two bonds: 13 x 13 = 169 optimizations
+umadriver mol.xyz --scan 1 2 1.4 2.6 13 --scan 3 4 1.2 2.4 13 --scan-mode grid
+
 # Optimize in implicit water (ALPB correction on every force and energy)
 umadriver molecule.xyz --opt Sella --alpb water
 
@@ -165,14 +175,26 @@ thermochemistry summary (qRRHO on by default).
   - `--sp`: single-point only (no optimization).
   - `--optts`: optimize to a 1st-order saddle. Implies Sella; conflicts with `--sp`
     and with any other `--opt`.
-  - `--scan I J FROM TO STEPS`: relaxed scan of the distance between atoms `I` and
-    `J` from `FROM` to `TO` Å in `STEPS` points. **Atoms are numbered from 1.** At
-    each point the bond is held fixed and everything else is minimized, starting
-    from the previous relaxed geometry. Writes `scan/<tag>_scan.csv` (the profile),
+  - `--scan ATOMS... FROM TO STEPS`: relaxed scan of an internal coordinate. The
+    number of values picks the type — `I J FROM TO STEPS` is a **distance** (Å),
+    `I J K …` an **angle** and `I J K L …` a **dihedral** (degrees, vertex in the
+    middle). **Atoms are numbered from 1.** At each point the scanned coordinates
+    are held fixed and everything else is minimized, starting from the previous
+    relaxed geometry. Writes `scan/<tag>_scan.csv` (the profile),
     `scan/<tag>_scan.xyz` (the path), and `scan/<tag>_scan_max.xyz` — the highest
     point, which is the structure to hand to `--optts`. Conflicts with `--optts`
-    and `--sp`. In a manifest: `scan: {i: 1, j: 2, from: 1.4, to: 2.6, steps: 13}`
-    or `scan: [1, 2, 1.4, 2.6, 13]`.
+    and `--sp`. Repeat `--scan` for several coordinates; in a manifest use
+    `scan: {distance: [1, 2], from: 1.4, to: 2.6, steps: 13}`, a list of those, or
+    the positional `scan: [1, 2, 1.4, 2.6, 13]`.
+  - `--scan-mode {sequential,concerted,grid}` *(default sequential)*: how several
+    coordinates combine. **sequential** scans them one after another, each starting
+    where the last finished (`sum(steps)` points, minus shared handovers).
+    **concerted** advances them all together along one path, so they must share a
+    step count (`steps` points). Both follow xtb's `$scan`. **grid** computes every
+    combination — a full 2D surface at `n1 × n2` optimizations, limited to exactly
+    two coordinates (a third would be `n³`). Grid points are walked in
+    boustrophedon order so each starts from a neighbouring geometry; pivot the CSV
+    on the two `_target` columns to get the surface as a matrix.
   - `--opt-mode {Loose,Normal,Tight,VeryTight}` *(default: Normal)*.
   - `--maxcycles INT` *(default: 300)*.
 - **Frequencies / Thermo**
@@ -504,17 +526,25 @@ See `LICENSE` in this repository.
 ## Changelog
 
 - **Unreleased**
-  - **Relaxed bond scans** — `--scan I J FROM TO STEPS`. Walks the distance between
-    two atoms, holding it fixed and minimizing everything else at each point, each
+  - **Relaxed scans over internal coordinates** — `--scan ATOMS… FROM TO STEPS`,
+    where the number of values picks a distance, angle or dihedral. Holds the
+    scanned coordinates fixed and minimizes everything else at each point, each
     point starting from the previous relaxed geometry. **Atoms are numbered from 1.**
-    Emits the profile as CSV, the path as an XYZ trajectory, and the highest point
-    on its own as a TS guess for `--optts`. Every point records the distance it
-    actually reached, not the one requested, and warns when the two differ.
+    Several coordinates combine the way xtb's `$scan` does: `--scan-mode sequential`
+    (default) walks them one after another, `concerted` advances them together
+    along one path. `grid` additionally computes a full 2D surface (`n1 × n2`
+    optimizations, capped at two coordinates), walked in boustrophedon order so
+    every point starts from a neighbour. Emits the profile as CSV, the path as an
+    XYZ trajectory, and the highest point on its own as a TS guess for `--optts`.
+    Every point records the value it actually reached, not the one requested, and
+    warns when they differ. Angles and dihedrals move the whole fragment on the far
+    side of the central bond; ASE's defaults move a single atom, which distorts a
+    molecule rather than rotating a group.
     Note for anyone using ASE constraints elsewhere with this model: UMA returns
     **float32** forces, and ASE's `FixBondLengths` enforces itself with a RATTLE
     iteration to a hard-coded 1e-13 tolerance that float32 cannot reach — it
-    exhausts `maxiter` and raises on every force evaluation. `umadriver.scan`
-    ships a float64 subclass that fixes it without loosening any tolerance.
+    exhausts `maxiter` and raises on every force evaluation, for some molecules but
+    not others. The scan uses `FixInternals` (tolerance 1e-7), which is unaffected.
   - **`optts` and `optimizer` can no longer disagree.** `optts` selects a saddle
     search and always used Sella, so any other `optimizer` was silently ignored and
     `optimizer: null` was ignored too — meaning a job written to say "frequencies on

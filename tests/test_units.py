@@ -312,11 +312,55 @@ def test_freq_ts_defaults_to_letting_the_route_decide(monkeypatch):
 
 
 def test_scan_reaches_the_workflow_verbatim(monkeypatch):
-    """The CLI must hand the raw 5 values through; parse_scan_spec does the
-    1-based conversion once, in one place, for both CLI and manifests."""
+    """The CLI hands the raw values through; parse_scan_spec does the 1-based
+    conversion once, in one place, for both CLI and manifests."""
     overrides = _run_cli(["mol.xyz", "--scan", "1", "2", "0.9", "1.6", "8"], monkeypatch)
 
-    assert overrides["scan"] == ["1", "2", "0.9", "1.6", "8"]
+    assert overrides["scan"] == {
+        "mode": "sequential",
+        "coords": [["1", "2", "0.9", "1.6", "8"]],
+    }
+
+
+def test_repeated_scan_flags_become_several_coordinates(monkeypatch):
+    """One --scan per coordinate, combined by --scan-mode."""
+    overrides = _run_cli(
+        [
+            "mol.xyz",
+            "--scan", "1", "2", "0.9", "1.6", "8",
+            "--scan", "2", "1", "3", "100", "140", "8",
+            "--scan-mode", "concerted",
+        ],
+        monkeypatch,
+    )
+
+    assert overrides["scan"]["mode"] == "concerted"
+    assert len(overrides["scan"]["coords"]) == 2
+
+    from umadriver.scan import parse_scan_spec
+
+    spec = parse_scan_spec(overrides["scan"])
+    assert [c.kind for c in spec.coords] == ["distance", "angle"]
+    assert spec.npoints == 8, "concerted traces one path, it does not build a grid"
+
+
+def test_scan_mode_without_scan_is_rejected(monkeypatch):
+    """Silently ignoring it would let someone think a concerted scan ran."""
+    with pytest.raises(SystemExit):
+        _run_cli(["mol.xyz", "--opt", "Sella", "--scan-mode", "concerted"], monkeypatch)
+
+
+def test_concerted_with_mismatched_steps_fails_at_argv(monkeypatch):
+    with pytest.raises(SystemExit):
+        _run_cli(
+            [
+                "mol.xyz",
+                "--scan", "1", "2", "0.9", "1.6", "8",
+                "--scan", "2", "1", "3", "100", "140", "5",
+                "--scan-mode", "concerted",
+            ],
+            monkeypatch,
+        )
 
 
 def test_scan_defaults_to_none(monkeypatch):

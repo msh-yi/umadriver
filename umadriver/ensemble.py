@@ -26,7 +26,7 @@ from .utils import (
     resolve_device,
     build_calculator,
 )
-from .scan import parse_scan_spec, run_bond_scan
+from .scan import parse_scan_spec, run_scan
 from .vib_thermo import (
     run_frequencies_and_write,
     rrho_thermo,
@@ -749,7 +749,7 @@ def run_conformer_workflow(
                     sella=sella if optimizer == "Sella" else None,
                 )
 
-            points = run_bond_scan(
+            points = run_scan(
                 a,
                 scan_spec,
                 relax=_relax,
