@@ -62,6 +62,7 @@ from .constants import DEFAULT_FAIRCHEM_CACHE, VAST_BASE
 from .batch import BatchCommon, run_batch_from_manifest, run_batch_from_glob
 from .vib_thermo import FREE_VOLUME_SOLVENTS
 from .scan import SCAN_MODES, parse_scan_spec
+from .slurm import SlurmOpts, job_name_from, strip_slurm_flags, write_script
 from .solvation import ALPB_METHODS
 
 LOG = logging.getLogger("umadriver")
@@ -285,6 +286,30 @@ def main():
     )
     p.add_argument("--irc-steps", type=int, default=200)
 
+    # --- SLURM ---------------------------------------------------------------
+    # Defaults reproduce the submit script this package has been run with.
+    _d = SlurmOpts()
+    p.add_argument(
+        "--submit",
+        action="store_true",
+        help="Write a SLURM batch script for this exact command into the current "
+        "directory and exit, instead of running it here. The script is not "
+        "submitted — read it, then `sbatch` it yourself.",
+    )
+    p.add_argument("--slurm-partition", default=_d.partition,
+                   help=f"SLURM partition (default {_d.partition}; use `gpu` for "
+                        "runs over 12 h or needing whole A100s).")
+    p.add_argument("--slurm-gpus", type=int, default=_d.gpus,
+                   help=f"GPUs to request (default {_d.gpus}).")
+    p.add_argument("--slurm-cpus", type=int, default=_d.cpus,
+                   help=f"CPU cores to request (default {_d.cpus}).")
+    p.add_argument("--slurm-mem", default=_d.mem,
+                   help=f"Memory to request (default {_d.mem}).")
+    p.add_argument("--slurm-time", default=_d.time,
+                   help=f"Walltime, HH:MM:SS or D-HH:MM:SS (default {_d.time}).")
+    p.add_argument("--slurm-job-name", default=None,
+                   help="Job name, and the script's filename (default uma_<input stem>).")
+
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--debug", action="store_true")
 
@@ -326,6 +351,31 @@ def main():
             p.error(str(e))
     elif args.scan_mode != "sequential":
         p.error("--scan-mode has no effect without --scan")
+
+    # Write the batch script and stop, before anything touches a GPU or the model
+    # cache — the point is that none of this runs on the login node.
+    if args.submit:
+        # Without this the script is written happily and fails on the node, after
+        # the job has waited in the queue.
+        if not args.inputs and not args.manifest:
+            p.error("--submit needs something to run: an input XYZ or --manifest.")
+        opts = SlurmOpts(
+            partition=args.slurm_partition,
+            gpus=args.slurm_gpus,
+            cpus=args.slurm_cpus,
+            mem=args.slurm_mem,
+            time=args.slurm_time,
+            job_name=args.slurm_job_name
+            or job_name_from(args.inputs, args.manifest),
+        )
+        command = ["umadriver"] + strip_slurm_flags(_strip_batch_token(sys.argv[1:]))
+        try:
+            path = write_script(command, opts)
+        except ValueError as e:
+            p.error(str(e))
+        print(f"Wrote {path}")
+        print(f"Submit with:  sbatch {os.path.basename(path)}")
+        return
 
     setup_logging(verbose=args.verbose, debug=args.debug)
     # Sets HF_HUB_OFFLINE=1 when the model cache is already populated, so a healthy

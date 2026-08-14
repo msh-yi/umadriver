@@ -117,6 +117,12 @@ umadriver mol.xyz --scan 1 2 1.4 2.6 13 --scan 2 1 3 104 130 13 --scan-mode conc
 # A full 2D surface over two bonds: 13 x 13 = 169 optimizations
 umadriver mol.xyz --scan 1 2 1.4 2.6 13 --scan 3 4 1.2 2.4 13 --scan-mode grid
 
+# Too long for the login node? Write a batch script for that same command and
+# submit it yourself. Nothing runs here.
+umadriver mol.xyz --scan 1 2 1.4 2.6 13 --scan 3 4 1.2 2.4 13 --scan-mode grid \
+    --submit --slurm-time 8:00:00
+sbatch uma_mol.sbatch
+
 # Optimize in implicit water (ALPB correction on every force and energy)
 umadriver molecule.xyz --opt Sella --alpb water
 
@@ -179,6 +185,19 @@ thermochemistry summary (qRRHO on by default).
     do not jump cold into their slice and risk a different basin (~7% extra
     optimizations). Results merge back into the same `scan/` files an unsharded run
     writes, so nothing downstream changes.
+- **SLURM**
+  - `--submit`: write a batch script for this exact command into the current
+    directory and exit, instead of running it here. The script is **not** submitted —
+    read it, edit if you like, then `sbatch` it. It reruns your own command line with
+    the `--slurm-*` flags stripped, sets the caches on netscratch (`UMA_CACHE_BASE`,
+    `FAIRCHEM_CACHE`, `HF_HOME`, `CUDA_CACHE_PATH`), loads `cuda/12.9` and
+    `Mambaforge`, and activates whichever conda env you invoked it from.
+  - `--slurm-partition NAME` *(default `gpu_test`)*, `--slurm-gpus N` *(6)*,
+    `--slurm-cpus N` *(16)*, `--slurm-mem SIZE` *(160g)*, `--slurm-time T` *(12:00:00)*,
+    `--slurm-job-name NAME` *(`uma_<input stem>`, and the script's filename)*.
+    On `gpu_test` a request over the documented limits is refused before the script is
+    written — 12 h, 8 MIG slices per job, and under 8 CPUs and 64 GB per slice. Use
+    `--slurm-partition gpu` for 3 days or whole A100s.
 - **Geometry**
   - `--opt OPT`: optimizer (`Sella`, `LBFGS`, `BFGS`, `BFGSLineSearch`, `FIRE`, `QuasiNewton`).
     If omitted, defaults to optimization unless `--sp` is given.
@@ -537,6 +556,15 @@ See `LICENSE` in this repository.
 ## Changelog
 
 - **Unreleased**
+  - **`--submit` writes a SLURM batch script** for the command you just typed and
+    stops, so a long run does not have to be babysat on the login node or hand-copied
+    into a submit script. It reruns your own argv with the `--slurm-*` flags stripped,
+    sets the caches on netscratch, loads `cuda/12.9` and `Mambaforge`, and activates
+    the conda env you invoked it from — read off the running interpreter rather than
+    `CONDA_DEFAULT_ENV`, which still says `base` when a package is called by full path
+    out of an env's `bin/`. The script is left for you to `sbatch`. Requests over the
+    documented `gpu_test` limits are refused before it is written, since those fail on
+    the node hours later rather than at submission.
   - **Large scans spread across the GPUs** — `--scan-shards` (default `auto`). A scan
     was one job on one card no matter how big, so a 14×14 grid ran 196 constrained
     optimizations in series while the other cards idled; only multi-structure inputs
