@@ -124,6 +124,15 @@ def main():
         help="Worker processes per GPU (default 1). >1 hides single-structure "
         "inference latency on large cards; costs VRAM linearly.",
     )
+    p.add_argument(
+        "--scan-shards",
+        default="auto",
+        metavar="auto|off|N",
+        help="Split a large --scan across GPUs (default auto). A grid is cut one "
+        "row per shard, anything else by worker slot; a short serial pass seeds "
+        "each shard so it still starts from a relaxed geometry. Results merge back "
+        "to the same scan/ files an unsharded run writes. `off` keeps it whole.",
+    )
 
     # Per-job parameters (applied uniformly to every input unless you use manifest overrides)
     p.add_argument(
@@ -336,6 +345,7 @@ def main():
         resume=args.resume,
         split_multi_structure=args.split_multi_structure,
         workers_per_gpu=args.workers_per_gpu,
+        scan_shards=args.scan_shards,
     )
 
     # Overrides are parameters of run_conformer_workflow()

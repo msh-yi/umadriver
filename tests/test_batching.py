@@ -334,6 +334,178 @@ def test_batch_level_keys_never_reach_workflow_overrides(tmp_path, monkeypatch):
         assert k not in ov, f"batch key {k!r} leaked into workflow overrides"
 
 
+# ------------------------------------------------------------------ scan sharding
+GRID = {
+    "mode": "grid",
+    "coords": [
+        {"distance": [1, 2], "from": 0.90, "to": 1.60, "steps": 8},
+        {"distance": [1, 3], "from": 0.90, "to": 1.60, "steps": 8},
+    ],
+}
+
+
+def _scan_job(tmp_path, scan=None, out="ens", **overrides):
+    return {
+        "xyz": _xyz(tmp_path, "one.xyz", 1),
+        "out_dir": str(tmp_path / out),
+        "overrides": {"scan": scan if scan is not None else GRID, **overrides},
+    }
+
+
+def _plan(jobs, monkeypatch=None, gpus=(), **merged):
+    from umadriver.batch import _plan_scan_shards
+
+    if monkeypatch is not None:
+        monkeypatch.setattr("umadriver.batch._discover_gpus", lambda d: list(gpus))
+    merged.setdefault("device", "cpu")
+    merged.setdefault("scan_shards", "auto")
+    return _plan_scan_shards(jobs, merged)
+
+
+def test_a_grid_becomes_a_spine_plus_one_shard_per_row(tmp_path, monkeypatch):
+    jobs, plans = _plan(
+        [_scan_job(tmp_path)], monkeypatch, gpus=["0", "1"], device="cuda"
+    )
+
+    assert len(plans) == 1
+    plan = plans[0]
+    # The job itself is replaced by its spine; the shards come later, once the
+    # spine has produced the geometries that seed them.
+    assert len(jobs) == 1
+    assert os.path.basename(jobs[0]["out_dir"]) == "spine"
+
+    # 8x8: one shard per row, and the spine walks each row's first point.
+    assert [len(g) for g in plan["groups"]] == [8] * 8
+    assert sorted(k for g in plan["groups"] for k in g) == list(range(64))
+    assert jobs[0]["overrides"]["scan_shard"]["indices"] == [g[0] for g in plan["groups"]]
+
+
+def test_the_partition_does_not_depend_on_the_machine(tmp_path, monkeypatch):
+    """Otherwise a rerun under a different GPU count would resume half of one
+    partition into half of another and merge a surface that never existed."""
+    job = _scan_job(tmp_path)
+    _, first = _plan([job], monkeypatch, gpus=["0", "1"], device="cuda")
+    _, second = _plan([job], monkeypatch, gpus=list("01234567"), device="cuda")
+
+    assert first[0]["groups"] == second[0]["groups"]
+    assert len(first[0]["groups"]) == 8
+
+
+def test_a_changed_scan_refuses_to_reuse_the_old_partition(tmp_path, caplog):
+    import logging
+
+    job = _scan_job(tmp_path)
+    _plan([job], scan_shards=4)  # writes .shards.json
+
+    wider = dict(job)
+    wider["overrides"] = {
+        "scan": {
+            "mode": "grid",
+            "coords": [
+                {"distance": [1, 2], "from": 0.90, "to": 2.00, "steps": 12},
+                {"distance": [1, 3], "from": 0.90, "to": 1.60, "steps": 8},
+            ],
+        }
+    }
+    with caplog.at_level(logging.WARNING, logger="uma.batch"):
+        jobs, plans = _plan([wider], scan_shards=4)
+
+    assert plans == []
+    assert jobs == [wider]  # runs whole rather than mixing two surfaces
+    assert any("different scan" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"scan_shards": "off"},
+        {"scan_shards": 1},
+        {"scan_shards": 0},
+    ],
+)
+def test_sharding_can_be_turned_off(tmp_path, kw):
+    jobs, plans = _plan([_scan_job(tmp_path)], **kw)
+    assert plans == []
+    assert len(jobs) == 1 and "spine" not in jobs[0]["out_dir"]
+
+
+def test_auto_does_not_shard_without_gpus(tmp_path):
+    """Sharding the serial CPU path is strictly worse: same points, extra cold
+    starts, no parallelism."""
+    jobs, plans = _plan([_scan_job(tmp_path)], scan_shards="auto", device="cpu")
+    assert plans == []
+
+
+def test_a_short_scan_is_not_worth_sharding(tmp_path):
+    short = {"mode": "grid", "coords": [
+        {"distance": [1, 2], "from": 0.9, "to": 1.1, "steps": 3},
+        {"distance": [1, 3], "from": 0.9, "to": 1.1, "steps": 3},
+    ]}
+    jobs, plans = _plan([_scan_job(tmp_path, scan=short)], scan_shards=3)
+    assert plans == []  # 9 points, below 2x SHARD_MIN_POINTS
+
+
+def test_non_scan_and_freq_jobs_are_left_alone(tmp_path):
+    plain = {"xyz": _xyz(tmp_path, "a.xyz", 1), "out_dir": str(tmp_path / "a"),
+             "overrides": {"charge": 0}}
+    freq = _scan_job(tmp_path, out="b", do_freq=True)
+
+    jobs, plans = _plan([plain, freq], scan_shards=4)
+
+    assert plans == []
+    assert jobs == [plain, freq]
+
+
+def test_a_finished_unsharded_scan_is_not_redone(tmp_path):
+    """Mirrors _already_done_unsplit: without this the merge would overwrite the
+    completed scan CSV with its own."""
+    job = _scan_job(tmp_path)
+    os.makedirs(job["out_dir"], exist_ok=True)
+    open(os.path.join(job["out_dir"], "energies.csv"), "w").close()
+
+    _, plans = _plan([job], scan_shards=4, resume=True)
+    assert plans == []
+
+    _, redo = _plan([job], scan_shards=4, resume=False)
+    assert len(redo) == 1
+
+
+def test_shards_never_share_a_cleanup_file(tmp_path):
+    """The worker deletes _cleanup_xyz on success and on error alike, so an
+    inherited one would have shard 0 delete the input its siblings still need."""
+    from umadriver.batch import _build_shard_jobs
+    from umadriver.scan import parse_scan_spec, run_scan
+    from ase.build import molecule
+    from ase.calculators.emt import EMT
+
+    job = _scan_job(tmp_path)
+    job["_cleanup_xyz"] = job["xyz"]
+    job["_original_xyz"] = str(tmp_path / "parent.xyz")
+    jobs, plans = _plan([job], scan_shards=4)
+
+    # stand in for the spine having run
+    atoms = molecule("H2O")
+    atoms.calc = EMT()
+    run_scan(
+        atoms,
+        parse_scan_spec(GRID),
+        relax=lambda a: (True, 1, float(a.get_potential_energy())),
+        out_dir=os.path.join(plans[0]["spine_dir"], "scan"),
+        tag="conf_0000",
+        shard=jobs[0]["overrides"]["scan_shard"],
+    )
+
+    shards = _build_shard_jobs(plans)
+
+    assert len(shards) == 4
+    assert all("_cleanup_xyz" not in s for s in shards)
+    assert len({s["out_dir"] for s in shards}) == 4
+    # each shard is seeded from its own geometry, not the original input
+    assert all(s["xyz"].endswith(f"seg{i:02d}.xyz") for i, s in enumerate(shards))
+    # and none of them looks like an ensemble member of <parent>
+    assert all("_original_xyz" not in s for s in shards)
+
+
 # ------------------------------------------------------------------ worker slots
 @pytest.mark.parametrize(
     "gpu_ids,per_gpu,expected",

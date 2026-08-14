@@ -23,7 +23,8 @@ from ase.constraints import FixAtoms
 from ase.io import read as ase_read
 from ase.optimize import LBFGS
 
-from umadriver.scan import parse_scan_spec, run_scan
+from umadriver.batch import _shard_groups
+from umadriver.scan import merge_scan_shards, parse_scan_spec, run_scan
 
 
 # ---------------------------------------------------------------- parsing
@@ -534,6 +535,226 @@ def test_unconverged_points_are_reported_not_hidden(tmp_path, caplog):
     assert any("did not converge" in r.message for r in caplog.records)
 
 
+# ---------------------------------------------------------------- sharding
+# A relax whose energy depends only on the constrained coordinates, so a sharded run
+# is directly comparable to an unsharded one: any difference is the sharding itself
+# and never the optimizer's path. Energies are negative on purpose — a string sort of
+# "-0.01" and "-0.5" puts them in the opposite order to a numeric one, which is what
+# catches an argmax over values that were never coerced back off the CSV.
+def _flat_pes(atoms):
+    d1 = atoms.get_distance(0, 1)
+    d2 = atoms.get_distance(0, 2)
+    return True, 1, -((d1 - 1.0) ** 2) - 2.0 * (d2 - 1.0) ** 2
+
+
+GRID = {
+    "mode": "grid",
+    "coords": [
+        {"distance": [1, 2], "from": 0.90, "to": 1.20, "steps": 4},
+        {"distance": [1, 3], "from": 0.90, "to": 1.20, "steps": 4},
+    ],
+}
+
+
+def _water():
+    atoms = molecule("H2O")
+    atoms.calc = EMT()
+    return atoms
+
+
+def _run_shards(tmp_path, spec, groups, traversal="rowmajor", relax=_flat_pes):
+    """Run each shard in its own directory, as separate workers would."""
+    dirs = []
+    for i, group in enumerate(groups):
+        d = str(tmp_path / f"shard{i:02d}")
+        run_scan(
+            _water(),
+            spec,
+            relax=relax,
+            out_dir=d,
+            tag="conf_0000",
+            shard={"traversal": traversal, "indices": list(group)},
+        )
+        dirs.append(d)
+    return dirs
+
+
+def test_sharded_grid_reproduces_the_unsharded_scan(tmp_path):
+    """The whole contract in one test: sharding changes who computes a point,
+    nothing about the point."""
+    spec = parse_scan_spec(GRID)
+    reference = run_scan(
+        _water(), spec, relax=_flat_pes, out_dir=str(tmp_path / "ref"), tag="conf_0000"
+    )
+
+    groups = _shard_groups(spec, "rowmajor", 4)
+    merged = merge_scan_shards(
+        _run_shards(tmp_path, spec, groups),
+        spec,
+        "rowmajor",
+        str(tmp_path / "merged"),
+        "conf_0000",
+    )
+
+    assert merged is not None
+    assert len(merged) == len(reference) == 16
+
+    # Order differs (rowmajor vs boustrophedon), so compare on physical identity:
+    # a point *is* its target values, and those must agree bit for bit.
+    def key(r):
+        return (r["d_1_2_target"], r["d_1_3_target"])
+
+    for want, got in zip(sorted(reference, key=key), sorted(merged, key=key)):
+        # Targets are bit-identical: every shard computes them from the same full
+        # spec, which is what lets the merged CSV be pivoted on these columns.
+        assert got["d_1_2_target"] == want["d_1_2_target"]
+        assert got["d_1_3_target"] == want["d_1_3_target"]
+        # Energies are not, and cannot be: set_distance lands within float noise of
+        # the target, and the noise depends on the geometry it started from — which
+        # sharding changes by design. A real mismatch here would be O(0.01), not
+        # O(1e-16).
+        assert got["energy_Eh"] == pytest.approx(want["energy_Eh"], abs=1e-12)
+        assert got["rel_kcal"] == pytest.approx(want["rel_kcal"], abs=1e-9)
+
+    with open(tmp_path / "merged" / "conf_0000_scan.csv") as f:
+        merged_header = next(csv.reader(f))
+    with open(tmp_path / "ref" / "conf_0000_scan.csv") as f:
+        assert next(csv.reader(f)) == merged_header
+
+
+def test_a_shard_keeps_global_point_numbers(tmp_path):
+    """Merging is a concatenation, which only works if indices are global."""
+    spec = parse_scan_spec(GRID)
+    full = spec.schedule("rowmajor")
+
+    (d,) = _run_shards(tmp_path, spec, [[4, 5, 6, 7]])
+    with open(os.path.join(d, "conf_0000_scan.csv")) as f:
+        rows = list(csv.DictReader(f))
+
+    assert [int(r["point"]) for r in rows] == [4, 5, 6, 7]
+    for k, row in zip([4, 5, 6, 7], rows):
+        assert float(row["d_1_2_target"]) == full[k][0]
+        assert float(row["d_1_3_target"]) == full[k][1]
+
+
+def test_out_of_range_shard_is_rejected(tmp_path):
+    spec = parse_scan_spec(GRID)
+    with pytest.raises(ValueError, match="16 points"):
+        run_scan(
+            _water(),
+            spec,
+            relax=_flat_pes,
+            out_dir=str(tmp_path / "bad"),
+            tag="conf_0000",
+            shard={"traversal": "rowmajor", "indices": [15, 16]},
+        )
+
+
+def test_merged_max_is_the_global_max(tmp_path):
+    """_scan_max.xyz feeds --optts, so picking it per-shard or off unconverted
+    strings would hand the user the wrong geometry."""
+    spec = parse_scan_spec(GRID)
+    groups = _shard_groups(spec, "rowmajor", 4)
+    merged = merge_scan_shards(
+        _run_shards(tmp_path, spec, groups),
+        spec,
+        "rowmajor",
+        str(tmp_path / "merged"),
+        "conf_0000",
+    )
+
+    top = max(merged, key=lambda r: r["energy_Eh"])
+    assert (top["d_1_2_target"], top["d_1_3_target"]) == (1.0, 1.0)  # the PES peak
+
+    guess = ase_read(str(tmp_path / "merged" / "conf_0000_scan_max.xyz"))
+    assert guess.get_distance(0, 1) == pytest.approx(1.0, abs=1e-6)
+    assert guess.get_distance(0, 2) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_merge_rereferences_rel_kcal_to_the_whole_surface(tmp_path):
+    """Each shard's rel_kcal is measured from its own lowest point."""
+    spec = parse_scan_spec(GRID)
+    groups = _shard_groups(spec, "rowmajor", 4)
+    dirs = _run_shards(tmp_path, spec, groups)
+
+    # every shard called its own minimum zero
+    for d in dirs:
+        with open(os.path.join(d, "conf_0000_scan.csv")) as f:
+            assert min(float(r["rel_kcal"]) for r in csv.DictReader(f)) == 0.0
+
+    merged = merge_scan_shards(
+        dirs, spec, "rowmajor", str(tmp_path / "merged"), "conf_0000"
+    )
+
+    lowest = min(merged, key=lambda r: r["energy_Eh"])
+    assert lowest["rel_kcal"] == 0.0
+    assert sum(1 for r in merged if r["rel_kcal"] == 0.0) == 1
+
+
+def test_merge_preserves_a_failed_point(tmp_path):
+    """csv.DictReader hands back the string 'False', and bool('False') is True."""
+    spec = parse_scan_spec(GRID)
+    groups = _shard_groups(spec, "rowmajor", 4)
+
+    dirs = []
+    for i, group in enumerate(groups):
+        d = str(tmp_path / f"shard{i:02d}")
+        run_scan(
+            _water(),
+            spec,
+            relax=_flat_pes if i else (lambda a: (False,) + _flat_pes(a)[1:]),
+            out_dir=d,
+            tag="conf_0000",
+            shard={"traversal": "rowmajor", "indices": list(group)},
+        )
+        dirs.append(d)
+
+    merged = merge_scan_shards(
+        dirs, spec, "rowmajor", str(tmp_path / "merged"), "conf_0000"
+    )
+
+    assert [r["converged"] for r in merged[:4]] == [False] * 4
+    assert all(r["converged"] for r in merged[4:])
+
+
+def test_an_incomplete_merge_writes_nothing_it_could_be_mistaken_for(tmp_path):
+    """A gap in a profile is not a shorter profile. Refusing to write is also what
+    lets the next --resume rerun only the shards that failed."""
+    spec = parse_scan_spec(GRID)
+    groups = _shard_groups(spec, "rowmajor", 4)
+    dirs = _run_shards(tmp_path, spec, groups)
+
+    merged = merge_scan_shards(
+        dirs[:2] + dirs[3:], spec, "rowmajor", str(tmp_path / "merged"), "conf_0000"
+    )
+
+    assert merged is None
+    out = tmp_path / "merged"
+    assert not (out / "conf_0000_scan.csv").exists()
+    assert not (out / "conf_0000_scan_max.xyz").exists()
+    assert (out / "conf_0000_scan.partial.csv").exists()
+
+
+def test_shard_groups_partition_the_scan(tmp_path):
+    spec = parse_scan_spec(GRID)
+    for n in (2, 3, 4):
+        groups = _shard_groups(spec, "rowmajor", n)
+        flat = [k for g in groups for k in g]
+        assert sorted(flat) == list(range(16))
+        assert len(flat) == len(set(flat))
+
+
+def test_a_sharded_grid_is_cut_on_row_boundaries(tmp_path):
+    """Each shard owns whole rows, so no shard starts a row in the middle."""
+    spec = parse_scan_spec(GRID)
+    full = spec.schedule("rowmajor")
+
+    for group in _shard_groups(spec, "rowmajor", 2):
+        rows = {full[k][0] for k in group}
+        # every point of every row this shard touches belongs to this shard
+        assert sum(1 for values in full if values[0] in rows) == len(group)
+
+
 # ---------------------------------------------------------------- with UMA
 def test_water_bond_scan_has_a_minimum_in_the_middle(
     tmp_path, h2o_xyz, uma_calc, energies
@@ -712,3 +933,68 @@ def test_scan_and_optts_are_rejected_together(tmp_path, h2o_xyz, uma_calc):
             optts=True,
             calc=uma_calc,
         )
+
+
+def test_a_sharded_grid_agrees_with_itself_end_to_end(
+    tmp_path, h2o_xyz, energies, requires_model
+):
+    """The whole two-phase path through the scheduler, with the real model.
+
+    Water's two O-H bonds are equivalent, so the surface must be symmetric under
+    swapping them. Here the two halves of that symmetry are computed by *different
+    shards*, seeded independently — so an asymmetry means a shard relaxed into a
+    different basin, which is the one failure mode no unit test can see.
+
+    Runs on CPU so the scheduler takes its serial loop instead of spawning workers,
+    which is fragile under pytest; sharding is requested explicitly because `auto`
+    correctly declines to shard when there are no GPUs.
+    """
+    from umadriver.batch import BatchCommon, run_batch_from_glob
+
+    out_root = str(tmp_path / "runs")
+    run_batch_from_glob(
+        [h2o_xyz],
+        BatchCommon(
+            out_root=out_root, device="cpu", resume=False, scan_shards=2
+        ),
+        scan={
+            "mode": "grid",
+            "coords": [
+                {"distance": [1, 2], "from": 0.90, "to": 1.20, "steps": 4},
+                {"distance": [1, 3], "from": 0.90, "to": 1.20, "steps": 4},
+            ],
+        },
+        opt_mode="Loose",
+        maxcycles=30,
+    )
+
+    ens = os.path.join(out_root, "h2o.ensemble")
+    assert os.path.isdir(os.path.join(ens, "shard00"))
+    assert os.path.isdir(os.path.join(ens, "shard01"))
+
+    # The merged profile lands where an unsharded run would have put it, so every
+    # documented path keeps working.
+    merged_csv = os.path.join(ens, "scan", "conf_0000_scan.csv")
+    assert os.path.isfile(merged_csv), "shards were never merged"
+    assert os.path.isfile(os.path.join(ens, "scan", "conf_0000_scan_max.xyz"))
+
+    with open(merged_csv) as f:
+        rows = list(csv.DictReader(f))
+    assert [int(r["point"]) for r in rows] == list(range(16))
+    assert all(r["converged"] == "True" for r in rows)
+
+    E = {
+        (round(float(r["d_1_2_target"]), 3), round(float(r["d_1_3_target"]), 3)): float(
+            r["energy_Eh"]
+        )
+        for r in rows
+    }
+    for (r1, r2), e in E.items():
+        assert e == pytest.approx(E[(r2, r1)], abs=1e-5), (
+            f"E({r1},{r2}) and E({r2},{r1}) disagree — a shard found a different "
+            f"basin than its mirror image"
+        )
+
+    (row,) = energies(os.path.join(ens, "energies.csv"))
+    assert row["route"] == "SCAN"
+    assert row["converged"] == "True"

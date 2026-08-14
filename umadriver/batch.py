@@ -4,11 +4,12 @@ import os
 import sys
 import csv
 import glob
+import hashlib
 import logging
 import json
 import multiprocessing as mp
 import queue
-from typing import Any, Dict, List, Optional, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dataclasses import dataclass
 
 LOG = logging.getLogger("uma.batch")
@@ -20,12 +21,15 @@ try:
 except Exception:
     _HAVE_YAML = False
 
+from ase.io import read as ase_read, write as ase_write
+
 from .ensemble import (
     run_conformer_workflow,
     _ensure_dir,
     rank_by_energy,
     ENERGIES_FIELDS,
 )
+from .scan import merge_scan_shards, parse_scan_spec
 
 
 # =========================
@@ -47,6 +51,10 @@ class BatchCommon:
     # Worker processes per GPU. >1 hides single-structure inference latency on
     # large cards; costs VRAM linearly.
     workers_per_gpu: int = 1
+    # Split a big relaxed scan into pieces that run on separate GPUs. "auto" shards
+    # a grid one row at a time and anything else by worker slot; "off"/1 keeps the
+    # scan whole. See _plan_scan_shards.
+    scan_shards: Any = "auto"
 
 
 # =========================
@@ -205,6 +213,357 @@ def _expand_jobs_with_splitting(
             expanded.append(member)
 
     return expanded
+
+
+# =========================
+# Spreading one scan over several GPUs
+# =========================
+# Below this, a shard spends more time cold-starting than it saves. A scan point
+# normally costs ~3 optimizer steps because it begins from the previous relaxed
+# point; the first point of a shard costs ~5 even seeded.
+SHARD_MIN_POINTS = 8
+
+
+def _already_done_unsharded(out_dir: str) -> bool:
+    """True if out_dir holds a scan that finished before sharding was applied here.
+
+    Exactly the ``_already_done_unsplit`` problem: sharding moves the work into
+    ``<out_dir>/shardNN/``, so a scan that previously completed whole has no shard
+    directories, every shard would recompute from scratch, and the merge would
+    overwrite the finished ``scan/*_scan.csv`` with its own.
+    """
+    if not os.path.isfile(os.path.join(out_dir, "energies.csv")):
+        return False
+    return not os.path.isdir(os.path.join(out_dir, "shard00"))
+
+
+def _scan_fingerprint(spec, traversal: str) -> str:
+    """Identifies the surface, so a resumed run can tell it is the same one."""
+    body = repr(
+        (
+            spec.mode,
+            traversal,
+            [(c.kind, c.indices, c.start, c.end, c.nsteps) for c in spec.coords],
+        )
+    )
+    return hashlib.sha1(body.encode()).hexdigest()[:16]
+
+
+def _contiguous_groups(items: List[int], n: int) -> List[List[int]]:
+    """Split into n near-equal contiguous groups."""
+    n = max(1, min(n, len(items)))
+    q, r = divmod(len(items), n)
+    out, i = [], 0
+    for g in range(n):
+        size = q + (1 if g < r else 0)
+        out.append(items[i : i + size])
+        i += size
+    return out
+
+
+def _shard_groups(spec, traversal: str, n_shards: int) -> List[List[int]]:
+    """Point indices for each shard, as contiguous runs of the schedule.
+
+    A grid is cut on row boundaries: a row is already a self-contained left-to-right
+    walk under ``rowmajor``, so a shard that owns whole rows never starts a row in
+    the middle.
+    """
+    full = spec.schedule(traversal)
+    if spec.mode == "grid":
+        rows: List[List[int]] = []
+        for k, values in enumerate(full):
+            if not rows or values[0] != full[rows[-1][0]][0]:
+                rows.append([])
+            rows[-1].append(k)
+        return [
+            [k for r in rg for k in rows[r]]
+            for rg in _contiguous_groups(list(range(len(rows))), n_shards)
+        ]
+    return _contiguous_groups(list(range(len(full))), n_shards)
+
+
+def _resolve_shard_count(scan_shards: Any, spec, n_slots: int) -> int:
+    """How many pieces to cut this scan into. 1 means do not shard."""
+    s = str(scan_shards).strip().lower() if scan_shards is not None else "off"
+
+    if s in ("off", "no", "none", "false"):
+        want = 1
+    elif s == "auto":
+        # A grid's row count is a property of the scan, not of the machine, so the
+        # partition comes out the same on 2 GPUs as on 8 — which is what makes it
+        # safe to reuse on a resumed run. The shared queue balances however many
+        # rows there are across however many slots exist.
+        if n_slots < 1:
+            want = 1
+        elif spec.mode == "grid":
+            want = spec.coords[0].nsteps
+        else:
+            want = n_slots
+    elif s.isdigit():
+        want = int(s)
+    else:
+        raise ValueError(
+            f"scan_shards must be 'auto', 'off' or a number, got {scan_shards!r}"
+        )
+
+    if want <= 1:
+        return 1
+    return max(1, min(want, spec.npoints // SHARD_MIN_POINTS))
+
+
+def _plan_one_scan(
+    job: Dict[str, Any], scan_shards: Any, n_slots: int, resume: bool
+) -> Optional[Dict[str, Any]]:
+    """Work out how to shard one job's scan, or None to leave the job alone."""
+    overrides = job.get("overrides") or {}
+    out_dir = job["out_dir"]
+    if not overrides.get("scan"):
+        return None
+
+    if overrides.get("do_freq"):
+        LOG.info(
+            "Job %s: not sharding — frequencies would be computed on each shard's "
+            "own last constrained point, which is meaningless N times over.",
+            job["xyz"],
+        )
+        return None
+
+    try:
+        spec = parse_scan_spec(overrides["scan"])
+    except Exception as e:
+        LOG.info("Job %s: not sharding (%s); the worker will report it.", job["xyz"], e)
+        return None
+
+    try:
+        if len(_split_xyz_into_structures(job["xyz"])) > 1:
+            LOG.info(
+                "Job %s: not sharding a multi-structure input. Leave "
+                "split_multi_structure on and each structure shards on its own.",
+                job["xyz"],
+            )
+            return None
+    except Exception:
+        return None
+
+    if resume and _already_done_unsharded(out_dir):
+        LOG.info(
+            "Job %s: %s already holds a completed unsharded scan; leaving it whole "
+            "so --resume can skip it (use --no-resume to redo it sharded).",
+            job["xyz"],
+            out_dir,
+        )
+        return None
+
+    traversal = "rowmajor" if spec.mode == "grid" else "boustrophedon"
+    n_shards = _resolve_shard_count(scan_shards, spec, n_slots)
+    if n_shards <= 1:
+        return None
+
+    scan_dir = os.path.join(out_dir, "scan")
+    state_path = os.path.join(scan_dir, ".shards.json")
+    fingerprint = _scan_fingerprint(spec, traversal)
+    groups: Optional[List[List[int]]] = None
+
+    if resume and os.path.isfile(state_path):
+        try:
+            with open(state_path) as f:
+                prev = json.load(f)
+        except Exception:
+            prev = None
+        if prev and prev.get("fingerprint") != fingerprint:
+            # The stored shard dirs hold points from a different surface, and their
+            # energies.csv files would let resume skip them — merging stale rows into
+            # the new scan with no error anywhere. Refuse rather than guess.
+            LOG.warning(
+                "Job %s: %s was sharded for a different scan. Not sharding this "
+                "one — rerun with --no-resume, or point it at a fresh out_dir.",
+                job["xyz"],
+                out_dir,
+            )
+            return None
+        if prev:
+            groups = [[int(k) for k in g] for g in prev["groups"]]
+            LOG.info("Job %s: reusing the stored %d-shard partition", job["xyz"], len(groups))
+
+    if groups is None:
+        groups = _shard_groups(spec, traversal, n_shards)
+        _ensure_dir(scan_dir)
+        with open(state_path, "w") as f:
+            json.dump(
+                {
+                    "fingerprint": fingerprint,
+                    "traversal": traversal,
+                    "npoints": spec.npoints,
+                    "groups": groups,
+                },
+                f,
+            )
+
+    LOG.info(
+        "Job %s: %d scan points over %d shards (%s), seeded by a %d-point spine",
+        job["xyz"],
+        spec.npoints,
+        len(groups),
+        traversal,
+        len(groups),
+    )
+
+    # The spine walks the first point of every shard, in order and chained, so each
+    # shard can start from a geometry that is already relaxed at its own first point
+    # instead of jumping there cold from the input and risking a different basin.
+    spine = dict(job)
+    spine["out_dir"] = os.path.join(out_dir, "spine")
+    spine["overrides"] = {
+        **overrides,
+        "scan_shard": {"traversal": traversal, "indices": [g[0] for g in groups]},
+    }
+    # It must not look like an ensemble member: _aggregate_split_ensembles groups on
+    # the parent of out_dir, which for the spine is the job's own out_dir.
+    spine.pop("_original_xyz", None)
+
+    return {
+        "job": job,
+        "spec": spec,
+        "traversal": traversal,
+        "groups": groups,
+        "parent": out_dir,
+        "spine_dir": spine["out_dir"],
+        "spine_job": spine,
+    }
+
+
+def _plan_scan_shards(
+    jobs: List[Dict[str, Any]], merged: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Replace each shardable scan job with its spine job; return (jobs, plans)."""
+    scan_shards = merged.get("scan_shards", "auto")
+    resume = bool(merged.get("resume", True))
+    slots = _worker_slots(
+        _discover_gpus(merged.get("device", "cuda")),
+        int(merged.get("workers_per_gpu", 1) or 1),
+    )
+
+    jobs_out: List[Dict[str, Any]] = []
+    plans: List[Dict[str, Any]] = []
+    for job in jobs:
+        plan = _plan_one_scan(
+            job, job.get("scan_shards", scan_shards), len(slots), resume
+        )
+        if plan is None:
+            jobs_out.append(job)
+        else:
+            jobs_out.append(plan["spine_job"])
+            plans.append(plan)
+    return jobs_out, plans
+
+
+def _build_shard_jobs(plans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """After the spines have run, emit one job per shard seeded from its geometry."""
+    shard_jobs: List[Dict[str, Any]] = []
+    for plan in plans:
+        spine_scan = os.path.join(plan["spine_dir"], "scan")
+        trajectories = sorted(glob.glob(os.path.join(spine_scan, "*_scan.xyz")))
+        if not trajectories:
+            LOG.error(
+                "Spine produced nothing in %s; leaving %s unsharded this run.",
+                spine_scan,
+                plan["parent"],
+            )
+            continue
+
+        traj = trajectories[0]
+        plan["tag"] = os.path.basename(traj)[: -len("_scan.xyz")]
+        frames = ase_read(traj, index=":")
+        if len(frames) != len(plan["groups"]):
+            LOG.error(
+                "Spine wrote %d geometries but there are %d shards (%s); leaving "
+                "%s unsharded this run.",
+                len(frames),
+                len(plan["groups"]),
+                traj,
+                plan["parent"],
+            )
+            continue
+
+        seed_dir = os.path.join(plan["parent"], "scan", ".seed")
+        _ensure_dir(seed_dir)
+        plan["shard_dirs"] = []
+        for i, (group, frame) in enumerate(zip(plan["groups"], frames)):
+            seed = os.path.join(seed_dir, f"seg{i:02d}.xyz")
+            ase_write(seed, frame, format="xyz")
+
+            child = dict(plan["job"])
+            child["xyz"] = seed
+            child["out_dir"] = os.path.join(plan["parent"], f"shard{i:02d}")
+            child["overrides"] = {
+                **(plan["job"].get("overrides") or {}),
+                "scan_shard": {"traversal": plan["traversal"], "indices": group},
+            }
+            # The parent's temp XYZ belongs to the spine, which has already used it.
+            # Inheriting it here would have shard 0 delete the file out from under
+            # its siblings. Seeds are left in place so a rerun can reuse them.
+            child.pop("_cleanup_xyz", None)
+            child.pop("_original_xyz", None)
+            shard_jobs.append(child)
+            plan["shard_dirs"].append(os.path.join(child["out_dir"], "scan"))
+
+    return shard_jobs
+
+
+def _aggregate_scan_shards(plans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge each scan's shards back into the files an unsharded run would write.
+
+    Returns one synthesized job per merged scan, standing in for the job that was
+    replaced by the spine and shards, so ``_aggregate_split_ensembles`` sees an
+    ordinary member at ``<parent>`` and needs no knowledge of shards.
+    """
+    parents: List[Dict[str, Any]] = []
+    for plan in plans:
+        if "shard_dirs" not in plan:
+            continue
+        records = merge_scan_shards(
+            plan["shard_dirs"],
+            plan["spec"],
+            plan["traversal"],
+            os.path.join(plan["parent"], "scan"),
+            plan["tag"],
+        )
+        if records is None:
+            # Deliberately no <parent>/energies.csv: its absence is what makes the
+            # next --resume rerun the shards that failed.
+            continue
+
+        last = records[-1]
+        row = {
+            "rank": 1,
+            "index": 0,
+            "tag": plan["tag"],
+            "route": "SCAN",
+            "converged": all(r["converged"] for r in records),
+            "steps": sum(r["steps"] for r in records),
+            "energy_Eh": last["energy_Eh"],
+            "energy_kcal": last["energy_kcal"],
+            "rel_kcal": 0.0,
+        }
+        out_csv = os.path.join(plan["parent"], "energies.csv")
+        with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=ENERGIES_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerow({k: row.get(k) for k in ENERGIES_FIELDS})
+
+        # The last shard holds the final point, which is what the row above reports.
+        tail = os.path.join(os.path.dirname(plan["shard_dirs"][-1]), "optimized_ranked.xyz")
+        if os.path.isfile(tail):
+            with open(tail) as src, open(
+                os.path.join(plan["parent"], "optimized_ranked.xyz"), "w"
+            ) as dst:
+                dst.write(src.read())
+
+        parent = dict(plan["job"])
+        parent.pop("_cleanup_xyz", None)
+        parents.append(parent)
+
+    return parents
 
 
 def _parse_visible_devices_env() -> Optional[List[str]]:
@@ -486,7 +845,14 @@ def run_batch_from_manifest(manifest_path: str, common: BatchCommon, **cli_overr
             **job_overrides,
         }
         _reject_ambiguous_ts_route(xyz, {**flattened, **job_overrides})
-        jobs.append({"xyz": xyz, "out_dir": out_dir, "overrides": overrides})
+        job = {"xyz": xyz, "out_dir": out_dir, "overrides": overrides}
+        # scan_shards is batch-level, so the filters above strip it — but a manifest
+        # with one big grid next to five small scans is exactly when it is wanted per
+        # job. Carry it through rather than dropping it silently.
+        per_job_shards = j.get("scan_shards", (j.get("overrides") or {}).get("scan_shards"))
+        if per_job_shards is not None:
+            job["scan_shards"] = per_job_shards
+        jobs.append(job)
 
     jobs = _expand_jobs_with_splitting(jobs, split_multi, resume=resume)
     return _run_parallel_jobs(jobs, merged)
@@ -622,8 +988,34 @@ def _aggregate_split_ensembles(jobs_in: List[Dict[str, Any]]) -> None:
 # Scheduler
 # =========================
 def _run_parallel_jobs(jobs_in: List[Dict[str, Any]], merged_common: Dict[str, Any]):
-    """Run all jobs, then compile any split multi-structure jobs into ranked ensembles."""
+    """Run all jobs, then compile split and sharded jobs back into ranked ensembles.
+
+    A sharded scan takes two passes: the spine jobs go through the queue alongside
+    every ordinary job, and only once they have produced their seed geometries can
+    the shard jobs be built and dispatched. Both passes use the same worker pool and
+    the same shared queue, so a batch of several scans still balances as one pool.
+    """
+    jobs_in, plans = _plan_scan_shards(jobs_in, merged_common)
     summary = _run_parallel_jobs_impl(jobs_in, merged_common)
+
+    if plans:
+        try:
+            shard_jobs = _build_shard_jobs(plans)
+        except Exception as e:
+            LOG.exception("Building scan shards failed: %s", e)
+            shard_jobs = []
+        if shard_jobs:
+            summary = summary + _run_parallel_jobs_impl(shard_jobs, merged_common)
+        try:
+            # Spine jobs are scaffolding; the merged parents stand in for the jobs
+            # they replaced so ensemble aggregation below sees ordinary members.
+            spines = {p["spine_dir"] for p in plans}
+            jobs_in = [
+                j for j in jobs_in if j["out_dir"] not in spines
+            ] + _aggregate_scan_shards(plans)
+        except Exception as e:
+            LOG.exception("Scan shard aggregation failed: %s", e)
+
     try:
         _aggregate_split_ensembles(jobs_in)
     except Exception as e:

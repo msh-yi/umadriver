@@ -5,7 +5,9 @@
 # Walk a distance, an angle or a dihedral from one value to another. At each point
 # the scanned coordinates are held fixed and everything else is minimized, so the
 # profile is a real slice through the PES rather than a rigid distortion. Each
-# point starts from the previous relaxed geometry, which keeps the path continuous.
+# point starts from the previous relaxed geometry, which keeps the path continuous
+# — see `scan_shards` at the bottom for how a large grid is split up without
+# losing that.
 #
 # ATOMS ARE NUMBERED FROM 1 — the first atom in the XYZ is atom 1, matching xtb,
 # Gaussian and your structure viewer. tests/data/h2o.xyz is:
@@ -78,10 +80,10 @@ jobs:
   # `grid` computes every combination: n1 * n2 optimizations. Limited to exactly
   # two coordinates, since a third turns a manageable 12x12 into 1728 points.
   #
-  # Points are walked in boustrophedon order (each row traversed opposite to the
-  # last), so consecutive points are always neighbours and every one starts from
-  # a good guess. Pivot the CSV on the two `_target` columns for the surface as a
-  # matrix.
+  # Run whole, points are walked in boustrophedon order (each row traversed
+  # opposite to the last), so consecutive points are always neighbours and every
+  # one starts from a good guess. Pivot the CSV on the two `_target` columns for
+  # the surface as a matrix.
   - xyz: tests/data/h2o.xyz
     out_dir: runs/scan_grid
     overrides:
@@ -90,7 +92,40 @@ jobs:
         coords:
           - {distance: [1, 2], from: 0.90, to: 1.30, steps: 5}
           - {distance: [1, 3], from: 0.90, to: 1.30, steps: 5}
-      # 5 x 5 = 25 optimizations
+      # 5 x 5 = 25 optimizations, too few to be worth splitting up
+
+  # --- a big surface, spread over the GPUs ----------------------------------
+  # A grid of any size is one job on one GPU, and 196 constrained optimizations
+  # in series is a long afternoon. `scan_shards` cuts it into pieces that run as
+  # separate jobs on the shared queue, alongside everything else in the manifest.
+  #
+  # A short serial pass ("the spine") walks the first point of every shard first,
+  # so each shard still starts from a relaxed geometry rather than jumping cold
+  # to its corner of the surface — costing about 7% extra optimizations to keep
+  # the surface continuous. Then:
+  #
+  #   scan/.shards.json   the partition, reused on resume
+  #   spine/              the seeding pass
+  #   shard00/ .. NN/     each holding its own slice, in the usual layout
+  #   scan/*.csv|xyz      the merged result, exactly where an unsharded run
+  #                       puts it — so the workflow above is unchanged
+  #
+  # `auto` (the default) gives a grid one shard per row, so the partition depends
+  # on the scan and not on how many GPUs happen to be free. That is what lets a
+  # resumed run reuse it safely. `off` keeps the scan whole.
+  - xyz: tests/data/h2o.xyz
+    out_dir: runs/scan_big_grid
+    scan_shards: auto      # or `off`, or a number
+    overrides:
+      scan:
+        mode: grid
+        coords:
+          - {distance: [1, 2], from: 0.90, to: 1.60, steps: 14}
+          - {distance: [1, 3], from: 0.90, to: 1.60, steps: 14}
+      # 14 x 14 = 196 optimizations -> 14 shards of 14
+      #
+      # Only the *outer* (first) coordinate is cut, so a 3 x 60 grid gets 3 shards
+      # while 60 x 3 gets 20. Put the coordinate you have more points of second.
 
   # --- the CLI's positional form --------------------------------------------
   # The number of values picks the coordinate type: 5 = distance, 6 = angle,
@@ -117,4 +152,10 @@ jobs:
 # converged. The profile is the result — read the CSV above.
 #
 # --freq on a scan warns and --irc is skipped: a constrained endpoint is not a
-# stationary point, so frequencies there carry spurious imaginary modes.
+# stationary point, so frequencies there carry spurious imaginary modes. A job
+# asking for frequencies is also never sharded, since each shard would compute
+# them on its own last constrained point.
+#
+# If a shard fails, the merge writes scan/*_scan.partial.csv and nothing else — a
+# profile with a hole in it is not a shorter profile, and *_scan_max.xyz is what
+# you would have fed to --optts. Rerun and --resume picks up only what is missing.

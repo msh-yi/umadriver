@@ -169,6 +169,16 @@ thermochemistry summary (qRRHO on by default).
     structure does not saturate a large card, so 2–3 can be close to a linear win.
     Costs VRAM linearly, and multiplies with `--freq-batch-size`. The CPU thread budget
     is divided across workers automatically.
+  - `--scan-shards auto|off|N` *(default: auto)*: split a large `--scan` across GPUs.
+    A scan is otherwise one job on one card, so a 14×14 grid is 196 constrained
+    optimizations in series. Shards go onto the same shared queue as every other
+    job. `auto` gives a grid one shard per row — a property of the scan, not of the
+    machine, so a resumed run reuses the same partition; anything else is cut by
+    worker slot. Never shards on CPU, below 16 points, or when `--freq` is on.
+    A short serial pass seeds each shard from a relaxed geometry first, so shards
+    do not jump cold into their slice and risk a different basin (~7% extra
+    optimizations). Results merge back into the same `scan/` files an unsharded run
+    writes, so nothing downstream changes.
 - **Geometry**
   - `--opt OPT`: optimizer (`Sella`, `LBFGS`, `BFGS`, `BFGSLineSearch`, `FIRE`, `QuasiNewton`).
     If omitted, defaults to optimization unless `--sp` is given.
@@ -192,9 +202,10 @@ thermochemistry summary (qRRHO on by default).
     **concerted** advances them all together along one path, so they must share a
     step count (`steps` points). Both follow xtb's `$scan`. **grid** computes every
     combination — a full 2D surface at `n1 × n2` optimizations, limited to exactly
-    two coordinates (a third would be `n³`). Grid points are walked in
+    two coordinates (a third would be `n³`). Run whole, grid points are walked in
     boustrophedon order so each starts from a neighbouring geometry; pivot the CSV
-    on the two `_target` columns to get the surface as a matrix.
+    on the two `_target` columns to get the surface as a matrix. See
+    `--scan-shards` for spreading a large grid over several GPUs.
   - `--opt-mode {Loose,Normal,Tight,VeryTight}` *(default: Normal)*.
   - `--maxcycles INT` *(default: 300)*.
 - **Frequencies / Thermo**
@@ -526,6 +537,20 @@ See `LICENSE` in this repository.
 ## Changelog
 
 - **Unreleased**
+  - **Large scans spread across the GPUs** — `--scan-shards` (default `auto`). A scan
+    was one job on one card no matter how big, so a 14×14 grid ran 196 constrained
+    optimizations in series while the other cards idled; only multi-structure inputs
+    ever fanned out. A shardable scan is now cut into pieces that join the same shared
+    queue as everything else, so job-level parallelism is unchanged and a manifest of
+    several scans still balances as one pool. A grid is cut one shard per row, which
+    makes the partition a property of the scan rather than of how many GPUs were free
+    — that is what lets a resumed run reuse it instead of merging half of one
+    partition into half of another. A short serial pass walks the first point of every
+    shard first and seeds each one, costing ~7% extra optimizations to keep shards from
+    jumping cold into their slice and relaxing into a different basin. Results merge
+    back to the same `scan/` paths an unsharded run writes, so `_scan_max.xyz` →
+    `--optts` is unchanged; an incomplete merge writes `*_scan.partial.csv` and nothing
+    else, since a profile with a hole in it is not a shorter profile.
   - **Relaxed scans over internal coordinates** — `--scan ATOMS… FROM TO STEPS`,
     where the number of values picks a distance, angle or dihedral. Holds the
     scanned coordinates fixed and minimizes everything else at each point, each

@@ -49,6 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from ase import Atoms
 from ase.constraints import FixInternals
+from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 from .constants import EV_PER_HARTREE, KCAL_PER_MOL_PER_EV
@@ -162,11 +163,23 @@ class ScanSpec:
             )
         return head + "".join("\n           " + c.describe() for c in self.coords)
 
-    def schedule(self) -> List[Tuple[float, ...]]:
+    def schedule(self, traversal: str = "boustrophedon") -> List[Tuple[float, ...]]:
         """The value every coordinate is held at, for each point in order.
 
         This is the whole difference between the modes, in one place.
+
+        ``traversal`` only affects a grid, and only the order — the set of points is
+        the same either way. ``"rowmajor"`` runs every row left to right, which is
+        what a sharded grid wants: each row is handed to a different worker and
+        becomes its own serial traversal, so alternating them would only mean half
+        the shards start at the far end of their row from their seed geometry.
         """
+        if traversal not in ("boustrophedon", "rowmajor"):
+            raise ValueError(
+                f"scan: traversal must be 'boustrophedon' or 'rowmajor', "
+                f"got {traversal!r}"
+            )
+
         if self.mode == "grid":
             outer, inner = self.coords
             points = []
@@ -174,7 +187,10 @@ class ScanSpec:
                 # Boustrophedon: reverse every other row so the step from the end
                 # of one row to the start of the next is a single inner-coordinate
                 # increment rather than a jump back across the whole range.
-                values = inner.targets if row % 2 == 0 else inner.targets[::-1]
+                if traversal == "boustrophedon" and row % 2:
+                    values = inner.targets[::-1]
+                else:
+                    values = inner.targets
                 points.extend((float(a), float(b)) for b in values)
         elif self.mode == "concerted":
             points = [
@@ -501,6 +517,7 @@ def run_scan(
     relax: Callable[[Atoms], Tuple[bool, int, float]],
     out_dir: str,
     tag: str,
+    shard: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the scan in place on ``atoms``; return one record per point.
 
@@ -509,20 +526,45 @@ def run_scan(
     module stays independent of the workflow, and so tests can drive it with a
     plain ASE optimizer and no model.
 
+    ``shard`` runs only part of the scan, as ``{"traversal": ..., "indices": [...]}``
+    where the indices are positions in ``spec.schedule(traversal)``. Records keep
+    their **global** index, so shards run by separate workers merge by concatenation
+    (see ``merge_scan_shards``). Every shard holds the identical full ``ScanSpec``,
+    so the target values it computes are bit-identical to every other shard's.
+
     On return ``atoms`` holds the final scan point and its original constraints.
     """
     _validate_against(atoms, spec)
     os.makedirs(out_dir, exist_ok=True)
 
+    traversal = (shard or {}).get("traversal", "boustrophedon")
+    full = spec.schedule(traversal)
+    if shard is None:
+        indices = list(range(len(full)))
+    else:
+        indices = [int(k) for k in shard["indices"]]
+        bad = [k for k in indices if not 0 <= k < len(full)]
+        if bad:
+            raise ValueError(
+                f"scan: shard asks for point(s) {bad}, but this scan has "
+                f"{len(full)} points (0..{len(full) - 1})"
+            )
+
     sym = atoms.get_chemical_symbols()
     LOG.info("  [SCAN] %s", spec.describe())
-    if spec.mode == "grid":
+    if shard is not None:
+        LOG.info(
+            "  [SCAN] this job runs %d of the %d points (%s)",
+            len(indices),
+            len(full),
+            _describe_indices(indices),
+        )
+    elif spec.mode == "grid":
         LOG.info(
             "  [SCAN] a grid is %d full constrained optimizations, run one after "
-            "another (each point starts from the previous, so they cannot be "
-            "parallelized within a job). Separate structures still fan out across "
-            "GPUs as usual.",
-            spec.npoints,
+            "another here because each point starts from the previous. Set "
+            "--scan-shards to spread the rows across GPUs instead.",
+            len(full),
         )
     for coord in spec.coords:
         LOG.info(
@@ -538,7 +580,8 @@ def run_scan(
     frames: List[Atoms] = []
 
     try:
-        for k, values in enumerate(spec.schedule()):
+        for k in indices:
+            values = full[k]
             # Clear before moving: the constraints would otherwise fight the
             # set_distance/set_angle/set_dihedral calls below.
             atoms.set_constraint()
@@ -590,7 +633,7 @@ def run_scan(
             LOG.info(
                 "  [SCAN] %3d/%d  %s  E=%.8f Eh  conv=%s  steps=%d",
                 k + 1,
-                spec.npoints,
+                len(full),
                 " ".join(reached),
                 E_h,
                 converged,
@@ -604,8 +647,16 @@ def run_scan(
         r["rel_kcal"] = (r["energy_Eh"] - e_min) * EH_TO_KCAL
 
     _write_outputs(records, frames, spec, out_dir, tag)
-    _log_profile(records, spec)
+    _log_profile(records, spec, sharded=shard is not None)
     return records
+
+
+def _describe_indices(indices: List[int]) -> str:
+    """`0-13` for a contiguous run, `0,14,28,...` otherwise."""
+    if len(indices) > 1 and indices == list(range(indices[0], indices[-1] + 1)):
+        return f"points {indices[0]}-{indices[-1]}"
+    head = ",".join(str(k) for k in indices[:4])
+    return f"points {head}..." if len(indices) > 4 else f"points {head}"
 
 
 def scan_fields(spec: ScanSpec) -> List[str]:
@@ -639,12 +690,24 @@ def _write_outputs(
     ase_write(os.path.join(out_dir, f"{tag}_scan_max.xyz"), frames[top], format="xyz")
 
 
-def _log_profile(records: List[Dict[str, Any]], spec: ScanSpec) -> None:
+def _log_profile(
+    records: List[Dict[str, Any]], spec: ScanSpec, *, sharded: bool = False
+) -> None:
     top = max(records, key=lambda r: r["energy_Eh"])
     unconverged = [r["point"] for r in records if not r["converged"]]
     where = " ".join(f"{c.label}={top[f'{c.label}_actual']:.4f}" for c in spec.coords)
 
-    if top["point"] in (0, len(records) - 1):
+    if sharded:
+        # A shard sees a slice, so its maximum sits at an edge almost every time and
+        # the "widen the window" advice below would be noise. The merged profile gets
+        # this treatment instead.
+        LOG.info(
+            "  [SCAN] shard maximum at point %d (%s) — see the merged profile for "
+            "the real one",
+            top["point"],
+            where,
+        )
+    elif top["point"] in (records[0]["point"], records[-1]["point"]):
         LOG.warning(
             "  [SCAN] highest point is at the %s of the range (%s). The barrier is "
             "probably outside the scanned window — widen it.",
@@ -668,3 +731,116 @@ def _log_profile(records: List[Dict[str, Any]], spec: ScanSpec) -> None:
             len(records),
             unconverged,
         )
+
+
+# =========================
+# Merging shards back together
+# =========================
+def _as_bool(v: Any) -> bool:
+    """CSV readback gives the *string* 'False', and bool('False') is True."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes")
+    return bool(v)
+
+
+def _read_shard(d: str, tag: str, fields: List[str]) -> Tuple[List[Dict], List[Atoms]]:
+    """One shard's records and frames, with every field coerced back off the CSV."""
+    with open(os.path.join(d, f"{tag}_scan.csv"), "r", newline="") as f:
+        raw = list(csv.DictReader(f))
+    frames = ase_read(os.path.join(d, f"{tag}_scan.xyz"), index=":")
+    if len(frames) != len(raw):
+        raise ValueError(
+            f"{d}: {len(raw)} csv rows but {len(frames)} frames — shard is damaged"
+        )
+
+    records = []
+    for row in raw:
+        rec: Dict[str, Any] = {}
+        for k in fields:
+            if k == "point" or k == "steps":
+                rec[k] = int(row[k])
+            elif k == "converged":
+                rec[k] = _as_bool(row[k])
+            else:
+                rec[k] = float(row[k])
+        records.append(rec)
+    return records, frames
+
+
+def _missing_ranges(have: set, npoints: int) -> str:
+    missing = [k for k in range(npoints) if k not in have]
+    if not missing:
+        return ""
+    runs, start = [], missing[0]
+    for a, b in zip(missing, missing[1:] + [None]):
+        if b != a + 1:
+            runs.append(f"{start}" if start == a else f"{start}-{a}")
+            start = b
+    return ", ".join(runs)
+
+
+def merge_scan_shards(
+    shard_dirs: List[str],
+    spec: ScanSpec,
+    traversal: str,
+    out_dir: str,
+    tag: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Stitch per-shard scan output into the files an unsharded run would write.
+
+    Returns the merged records, or ``None`` if any point is missing. A gap is not a
+    shorter profile, it is a wrong one — and ``*_scan_max.xyz`` is what people feed
+    to ``--optts`` — so an incomplete merge writes ``<tag>_scan.partial.csv`` and
+    nothing else. Leaving the real outputs absent is also what lets the next
+    ``--resume`` rerun just the shards that failed.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    fields = scan_fields(spec)
+    npoints = len(spec.schedule(traversal))
+
+    by_point: Dict[int, Tuple[Dict[str, Any], Atoms]] = {}
+    for d in shard_dirs:
+        try:
+            records, frames = _read_shard(d, tag, fields)
+        except (OSError, ValueError, KeyError) as e:
+            LOG.error("  [SCAN] shard %s unusable: %s", d, e)
+            continue
+        for rec, frame in zip(records, frames):
+            by_point[rec["point"]] = (rec, frame)
+
+    ordered = [by_point[k] for k in sorted(by_point)]
+    merged = [rec for rec, _ in ordered]
+    frames = [frame for _, frame in ordered]
+
+    if len(by_point) != npoints:
+        gaps = _missing_ranges(set(by_point), npoints)
+        partial = os.path.join(out_dir, f"{tag}_scan.partial.csv")
+        with open(partial, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            for r in merged:
+                w.writerow({k: r[k] for k in fields})
+        LOG.error(
+            "  [SCAN] merge incomplete: %d/%d points, missing %s. Wrote %s and "
+            "nothing else — rerun to fill the gaps.",
+            len(by_point),
+            npoints,
+            gaps,
+            partial,
+        )
+        return None
+
+    # rel_kcal was shard-local; re-reference it to the minimum of the whole surface.
+    e_min = min(r["energy_Eh"] for r in merged)
+    for r in merged:
+        r["rel_kcal"] = (r["energy_Eh"] - e_min) * EH_TO_KCAL
+
+    _write_outputs(merged, frames, spec, out_dir, tag)
+    LOG.info(
+        "  [SCAN] merged %d shards into %d points: %s",
+        len(shard_dirs),
+        npoints,
+        os.path.join(out_dir, f"{tag}_scan.csv"),
+    )
+    _log_profile(merged, spec)
+    return merged

@@ -406,6 +406,9 @@ def run_conformer_workflow(
     # Relaxed scan along a bond distance: [i, j, from, to, steps] with atoms
     # numbered from 1, or {i, j, from, to, steps}. See umadriver.scan.
     scan: Optional[Any] = None,
+    # Run only part of that scan: {"traversal": ..., "indices": [...]}. Set by the
+    # batch scheduler when it spreads a scan over several GPUs; see umadriver.batch.
+    scan_shard: Optional[Dict[str, Any]] = None,
     # frequency / thermo
     do_freq: bool = False,
     freq_ts: Optional[
@@ -494,6 +497,8 @@ def run_conformer_workflow(
     # implements with Sella (order=1) — so optts implies Sella rather than
     # leaving `optimizer` to say something that will be ignored.
     scan_spec = parse_scan_spec(scan) if scan is not None else None
+    if scan_spec is None and scan_shard is not None:
+        raise ValueError("scan_shard names part of a scan, but no scan was given")
     if scan_spec is not None:
         if optts:
             raise ValueError(
@@ -755,6 +760,7 @@ def run_conformer_workflow(
                 relax=_relax,
                 out_dir=os.path.join(out_dir, "scan"),
                 tag=tag,
+                shard=scan_shard,
             )
             # The row below is a summary, not a result — the profile in
             # scan/<tag>_scan.csv is the product. Energy is the last point (which
